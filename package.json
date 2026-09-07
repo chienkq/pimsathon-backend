@@ -1,0 +1,27 @@
+{
+  "name": "@chienkq/workflow-server",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "clean": "rm -rf dist .turbo",
+    "check:types": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@chienkq/workflow-core": "workspace:*",
+    "@chienkq/workflow-db": "workspace:*",
+    "dotenv": "^17.2.3",
+    "drizzle-orm": "^0.44.6",
+    "fastify": "^5.6.2",
+    "node-cron": "^4.2.1"
+  },
+  "devDependencies": {
+    "typescript": "catalog:",
+    "tsx": "^4.20.6",
+    "@types/node": "^24.13.3",
+    "@types/node-cron": "^3.0.11"
+  }
+}

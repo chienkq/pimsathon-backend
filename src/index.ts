@@ -17,7 +17,6 @@ import {
   pullRequests,
   repositories,
   widgets,
-  workItems,
 } from "@chienkq/workflow-db";
 import { desc, eq } from "drizzle-orm";
 import Fastify from "fastify";

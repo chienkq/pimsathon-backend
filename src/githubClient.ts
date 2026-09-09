@@ -1,4 +1,4 @@
-import type { GitBranch, GitClientService, GitCommit, GitIssue, GitPullRequest, GitRepositoryInfo } from "@chienkq/workflow-core";
+import type { GitBranch, GitClientService, GitCommit, GitIssue, GitPullRequest } from "@chienkq/workflow-core";
 
 interface GitHubApiError {
   message?: string;

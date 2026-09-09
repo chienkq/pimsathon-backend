@@ -16,4 +16,14 @@ export const env = {
   githubToken: process.env.GITHUB_TOKEN ?? "",
   githubOwner: process.env.GITHUB_OWNER ?? "",
   githubRepo: process.env.GITHUB_REPO ?? "",
+  // AES-256-GCM key (64 hex chars) used to encrypt rows in the `credentials` table (Integrations
+  // screen, W6). Falls back to an insecure dev-only key so local dev doesn't need extra setup —
+  // ALWAYS set a real one via `openssl rand -hex 32` before this backend is exposed beyond localhost.
+  credentialsEncryptionKey: process.env.CREDENTIALS_ENCRYPTION_KEY ?? "0".repeat(64),
 };
+
+if (!process.env.CREDENTIALS_ENCRYPTION_KEY) {
+  console.warn(
+    "[env] CREDENTIALS_ENCRYPTION_KEY not set — using an insecure dev-only key. Stored integration credentials are NOT safe in this mode.",
+  );
+}

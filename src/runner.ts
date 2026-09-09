@@ -8,6 +8,7 @@ import {
   type PlanningGroupStoreService,
   type WidgetStoreService,
   type WorkflowDefinition,
+  type WorkflowExecutionResult,
   type WorkItemStoreService,
 } from "@chienkq/workflow-core";
 import { connectorStatus, workflowRuns, workflows, type WorkflowDb } from "@chienkq/workflow-db";
@@ -45,7 +46,7 @@ export async function runWorkflow(
   trigger: "schedule" | "webhook" | "manual",
   /** Only connector-sync workflows (e.g. W1 Jira Sync) touch `connector_status` — rule workflows like W11 don't. */
   connectorProvider?: string,
-): Promise<"success" | "error"> {
+): Promise<WorkflowExecutionResult> {
   const runId = crypto.randomUUID();
   await db.insert(workflowRuns).values({ id: runId, workflowId: workflow.id, status: "running", trigger });
 
@@ -69,7 +70,7 @@ export async function runWorkflow(
           set: { lastSyncAt: new Date(), lastSuccess: result.status === "success", lastError: null },
         });
     }
-    return result.status;
+    return result;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     await db

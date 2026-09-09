@@ -13,4 +13,7 @@ export const env = {
   jiraEmail: process.env.JIRA_EMAIL ?? "",
   jiraApiToken: process.env.JIRA_API_TOKEN ?? "",
   jiraJqlQuery: process.env.JIRA_JQL_QUERY ?? "updated >= -20m ORDER BY updated ASC",
+  githubToken: process.env.GITHUB_TOKEN ?? "",
+  githubOwner: process.env.GITHUB_OWNER ?? "",
+  githubRepo: process.env.GITHUB_REPO ?? "",
 };

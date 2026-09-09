@@ -1,6 +1,14 @@
-import type { FactStoreService, NormalizedWorkItemFact } from "@chienkq/workflow-core";
+import type { FactStoreService, NormalizedWorkItemFact, StoredWorkItemFact, WorkItemFactFilter } from "@chienkq/workflow-core";
 import { workItemFacts, type WorkflowDb } from "@chienkq/workflow-db";
-import { sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
+
+const FILTER_COLUMNS = {
+  provider: workItemFacts.provider,
+  projectKey: workItemFacts.projectKey,
+  status: workItemFacts.status,
+  priority: workItemFacts.priority,
+  assignee: workItemFacts.assignee,
+} as const;
 
 /** Real Postgres-backed implementation of `services.factStore` for the `factUpsert` node. */
 export function createFactStore(db: WorkflowDb): FactStoreService {
@@ -29,6 +37,26 @@ export function createFactStore(db: WorkflowDb): FactStoreService {
             }),
         ),
       );
+    },
+
+    async queryWorkItems(filter: WorkItemFactFilter): Promise<StoredWorkItemFact[]> {
+      const conditions = (Object.entries(filter) as [keyof WorkItemFactFilter, string | undefined][])
+        .filter(([, value]) => value !== undefined)
+        .map(([key, value]) => eq(FILTER_COLUMNS[key], value as string));
+
+      const rows = await db
+        .select()
+        .from(workItemFacts)
+        .where(conditions.length > 0 ? and(...conditions) : undefined);
+
+      return rows.map((row) => ({
+        ...row,
+        priority: row.priority ?? undefined,
+        assignee: row.assignee ?? undefined,
+        storyPoints: row.storyPoints ?? undefined,
+        sprintId: row.sprintId ?? undefined,
+        syncedAt: row.syncedAt.toISOString(),
+      }));
     },
   };
 }

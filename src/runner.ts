@@ -1,10 +1,28 @@
-import { executeWorkflow, type FactStoreService, type JiraClientService, type WorkflowDefinition } from "@chienkq/workflow-core";
+import {
+  executeWorkflow,
+  type AlertStoreService,
+  type FactStoreService,
+  type GitCacheStoreService,
+  type GitClientService,
+  type JiraClientService,
+  type PlanningGroupStoreService,
+  type WidgetStoreService,
+  type WorkflowDefinition,
+  type WorkItemStoreService,
+} from "@chienkq/workflow-core";
 import { connectorStatus, workflowRuns, workflows, type WorkflowDb } from "@chienkq/workflow-db";
 import { eq } from "drizzle-orm";
 
+/** The full service bag, passed to every workflow run — a node just ignores the keys it doesn't ask for. */
 export interface RunnerServices {
   jiraClient: JiraClientService;
   factStore: FactStoreService;
+  alertStore: AlertStoreService;
+  workItemStore: WorkItemStoreService;
+  widgetStore: WidgetStoreService;
+  planningGroupStore: PlanningGroupStoreService;
+  gitClient: GitClientService;
+  gitCacheStore: GitCacheStoreService;
 }
 
 /** Idempotent — call once at startup so `workflow_runs`'s FK to `workflows` always has a target row. */
@@ -25,6 +43,8 @@ export async function runWorkflow(
   workflow: WorkflowDefinition,
   services: RunnerServices,
   trigger: "schedule" | "webhook" | "manual",
+  /** Only connector-sync workflows (e.g. W1 Jira Sync) touch `connector_status` — rule workflows like W11 don't. */
+  connectorProvider?: string,
 ): Promise<"success" | "error"> {
   const runId = crypto.randomUUID();
   await db.insert(workflowRuns).values({ id: runId, workflowId: workflow.id, status: "running", trigger });
@@ -40,13 +60,15 @@ export async function runWorkflow(
       })
       .where(eq(workflowRuns.id, runId));
 
-    await db
-      .insert(connectorStatus)
-      .values({ provider: "jira", lastSyncAt: new Date(), lastSuccess: result.status === "success" })
-      .onConflictDoUpdate({
-        target: connectorStatus.provider,
-        set: { lastSyncAt: new Date(), lastSuccess: result.status === "success", lastError: null },
-      });
+    if (connectorProvider) {
+      await db
+        .insert(connectorStatus)
+        .values({ provider: connectorProvider, lastSyncAt: new Date(), lastSuccess: result.status === "success" })
+        .onConflictDoUpdate({
+          target: connectorStatus.provider,
+          set: { lastSyncAt: new Date(), lastSuccess: result.status === "success", lastError: null },
+        });
+    }
     return result.status;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -54,10 +76,15 @@ export async function runWorkflow(
       .update(workflowRuns)
       .set({ status: "error", finishedAt: new Date(), error: message })
       .where(eq(workflowRuns.id, runId));
-    await db
-      .insert(connectorStatus)
-      .values({ provider: "jira", lastSyncAt: new Date(), lastSuccess: false, lastError: message })
-      .onConflictDoUpdate({ target: connectorStatus.provider, set: { lastSyncAt: new Date(), lastSuccess: false, lastError: message } });
+    if (connectorProvider) {
+      await db
+        .insert(connectorStatus)
+        .values({ provider: connectorProvider, lastSyncAt: new Date(), lastSuccess: false, lastError: message })
+        .onConflictDoUpdate({
+          target: connectorStatus.provider,
+          set: { lastSyncAt: new Date(), lastSuccess: false, lastError: message },
+        });
+    }
     throw error;
   }
 }

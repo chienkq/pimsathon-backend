@@ -1,4 +1,5 @@
 import type { JiraClientService, JiraIssue } from "@chienkq/workflow-core";
+import type { CredentialStore } from "./credentialStore.js";
 
 interface JiraSearchResponse {
   issues: { id: string; key: string; fields: Record<string, unknown> }[];
@@ -25,6 +26,27 @@ export function createJiraClient(config: { baseUrl: string; email: string; apiTo
       const data = (await response.json()) as JiraSearchResponse;
       const issues: JiraIssue[] = data.issues.map((issue) => ({ id: issue.id, key: issue.key, fields: issue.fields }));
       return issues;
+    },
+  };
+}
+
+/**
+ * `services.jiraClient` wrapper that reads the site URL/email/API token from the credentials table
+ * (Settings → Integrations) on every call instead of once at startup from env vars — same pattern as
+ * `createGitClientFromCredentials` — so reconfiguring Jira in Settings takes effect on the next sync
+ * tick without a backend restart.
+ */
+export function createJiraClientFromCredentials(credentialStore: CredentialStore): JiraClientService {
+  return {
+    async searchIssues(jql, maxResults) {
+      const config = await credentialStore.getConfig("jira");
+      if (!config?.baseUrl || !config.email || !config.apiToken) {
+        throw new Error("Jira is not connected. Configure it in Settings → Integrations.");
+      }
+      return createJiraClient({ baseUrl: config.baseUrl, email: config.email, apiToken: config.apiToken }).searchIssues(
+        jql,
+        maxResults,
+      );
     },
   };
 }

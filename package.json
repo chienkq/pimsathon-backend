@@ -15,10 +15,12 @@
     "@chienkq/workflow-core": "workspace:*",
     "@chienkq/workflow-db": "workspace:*",
     "@fastify/cors": "^11.3.0",
+    "@fastify/multipart": "^10.1.1",
     "dotenv": "^17.2.3",
     "drizzle-orm": "^0.44.6",
     "fastify": "^5.6.2",
-    "node-cron": "^4.2.1"
+    "node-cron": "^4.2.1",
+    "xlsx": "^0.18.5"
   },
   "devDependencies": {
     "@types/node": "^24.13.3",

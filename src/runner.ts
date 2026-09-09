@@ -14,6 +14,15 @@ import {
 import { connectorStatus, workflowRuns, workflows, type WorkflowDb } from "@chienkq/workflow-db";
 import { eq } from "drizzle-orm";
 
+/** A registered workflow's source: either a fixed definition, or a factory re-run before every
+ *  scheduled tick (used by W3 GitHub Sync so a credential change in Settings → Integrations takes
+ *  effect on the next run without a backend restart). */
+export type WorkflowSource = WorkflowDefinition | (() => Promise<WorkflowDefinition>);
+
+export async function resolveWorkflow(source: WorkflowSource): Promise<WorkflowDefinition> {
+  return typeof source === "function" ? source() : source;
+}
+
 /** The full service bag, passed to every workflow run — a node just ignores the keys it doesn't ask for. */
 export interface RunnerServices {
   jiraClient: JiraClientService;

@@ -1,4 +1,5 @@
 import type { WorkflowDefinition } from "@chienkq/workflow-core";
+import type { CredentialStore } from "./credentialStore.js";
 import { env } from "./env.js";
 
 export const JIRA_SYNC_WORKFLOW_ID = "w1-jira-sync";
@@ -329,13 +330,13 @@ export const GITHUB_SYNC_WORKFLOW_ID = "w3-github-sync";
 
 /**
  * W3 from the PM-workflow blueprint: 4 independent git(read) -> gitCacheUpsert chains, one per
- * entity (repository info, branches, PRs, issues) — all against the real repo (see env.githubOwner/
- * env.githubRepo), read-only for now (no Create Issue/Branch/PR wired in yet).
+ * entity (repository info, branches, PRs, issues) — read-only for now (no Create Issue/Branch/PR
+ * wired in yet). `owner`/`repo` come from the Integrations screen's stored GitHub credential (see
+ * `buildGitHubSyncWorkflowFromCredentials`), not env vars — rebuilt fresh on every scheduled run so
+ * a reconfigure in Settings takes effect on the next tick.
  */
-export function buildGitHubSyncWorkflow(): WorkflowDefinition {
+export function buildGitHubSyncWorkflow(owner: string, repo: string): WorkflowDefinition {
   const now = new Date().toISOString();
-  const owner = env.githubOwner;
-  const repo = env.githubRepo;
   return {
     id: GITHUB_SYNC_WORKFLOW_ID,
     name: "GitHub Sync",
@@ -362,4 +363,10 @@ export function buildGitHubSyncWorkflow(): WorkflowDefinition {
       { id: "issues-to-cache", source: "listIssues", target: "cacheIssues" },
     ],
   };
+}
+
+/** Reads the `github` row from the credentials table (owner/repo fields) and builds W3 against it. */
+export async function buildGitHubSyncWorkflowFromCredentials(credentialStore: CredentialStore): Promise<WorkflowDefinition> {
+  const config = await credentialStore.getConfig("github");
+  return buildGitHubSyncWorkflow(config?.owner ?? "", config?.repo ?? "");
 }

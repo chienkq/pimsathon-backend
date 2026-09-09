@@ -3,7 +3,8 @@ import Fastify from "fastify";
 /**
  * Stands in for a real Jira Cloud site while no tenant/credentials exist yet. Speaks the same
  * `/rest/api/3/search` contract `jiraClient.ts` calls in production, so switching to a real Jira
- * later is a one-line env change (`JIRA_BASE_URL`) — no code changes to the `jira` node or client.
+ * later is just reconfiguring the Site URL in Settings → Integrations — no code changes to the
+ * `jira` node or client.
  */
 
 interface FakeIssue {
@@ -63,4 +64,6 @@ app.post("/rest/api/3/search", async (request, reply) => {
 
 const port = Number(process.env.FAKE_JIRA_PORT ?? 4001);
 await app.listen({ port, host: "0.0.0.0" });
-console.log(`Fake Jira listening at http://localhost:${port} — set JIRA_BASE_URL=http://localhost:${port}`);
+console.log(
+  `Fake Jira listening at http://localhost:${port} — set Site URL to http://localhost:${port} in Settings → Integrations`,
+);

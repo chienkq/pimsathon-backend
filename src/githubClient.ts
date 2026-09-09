@@ -1,4 +1,5 @@
 import type { GitBranch, GitClientService, GitCommit, GitIssue, GitPullRequest } from "@chienkq/workflow-core";
+import type { CredentialStore } from "./credentialStore.js";
 
 interface GitHubApiError {
   message?: string;
@@ -118,5 +119,32 @@ export function createGitClient(config: { token: string }): GitClientService {
       );
       return { number: data.number, title: data.title, headBranch: data.head.ref, baseBranch: data.base.ref, status: "Open", url: data.html_url };
     },
+  };
+}
+
+/**
+ * `GitClientService` backed by the Integrations screen's stored credential (`credentials` table,
+ * provider `github`) instead of a fixed token — looked up fresh on every call so a reconfigure in
+ * Settings takes effect on the next scheduled sync without a backend restart. Throws a message aimed
+ * at the end user (surfaced via `runWorkflow`'s `connector_status` write) when nothing is configured
+ * yet, so the Integrations card and any UI reading `connector_status` show the same "not connected"
+ * state.
+ */
+export function createGitClientFromCredentials(credentialStore: CredentialStore): GitClientService {
+  async function client(): Promise<GitClientService> {
+    const config = await credentialStore.getConfig("github");
+    if (!config?.token) throw new Error("GitHub is not connected. Configure it in Settings → Integrations.");
+    return createGitClient({ token: config.token });
+  }
+
+  return {
+    getRepository: async (owner, repo) => (await client()).getRepository(owner, repo),
+    listBranches: async (owner, repo) => (await client()).listBranches(owner, repo),
+    listCommits: async (owner, repo, branch) => (await client()).listCommits(owner, repo, branch),
+    listPullRequests: async (owner, repo, state) => (await client()).listPullRequests(owner, repo, state),
+    listIssues: async (owner, repo, state) => (await client()).listIssues(owner, repo, state),
+    createIssue: async (owner, repo, input) => (await client()).createIssue(owner, repo, input),
+    createBranch: async (owner, repo, input) => (await client()).createBranch(owner, repo, input),
+    createPullRequest: async (owner, repo, input) => (await client()).createPullRequest(owner, repo, input),
   };
 }

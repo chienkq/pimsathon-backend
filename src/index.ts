@@ -331,9 +331,9 @@ app.get("/api/members", async () => ({ members: await db.select().from(members) 
 
 app.get("/api/work-items", async () => ({ workItems: await services.workItemStore.list({}) }));
 
-// admin-ui's own write path — upsert-by-id, scoped to the fields admin-ui owns (see adminUiSync.ts
-// for why `cycleId`/`moduleIds` are excluded). admin-ui assigns `id`/`number` itself and this never
-// overrides them, so identity always stays admin-ui's local reducer's call, not this backend's.
+// admin-ui's own write path — upsert-by-id, scoped to the fields admin-ui owns (see adminUiSync.ts).
+// admin-ui assigns `id`/`number` itself and this never overrides them, so identity always stays
+// admin-ui's local reducer's call, not this backend's.
 app.put("/api/work-items/:id", async (request, reply) => {
   const { id } = request.params as { id: string };
   const body = request.body as Partial<AdminUiWorkItemFields> | undefined;
@@ -353,6 +353,8 @@ app.put("/api/work-items/:id", async (request, reply) => {
       labels: body.labels ?? [],
       startDate: body.startDate ?? "",
       dueDate: body.dueDate ?? "",
+      cycleId: body.cycleId ?? "",
+      moduleIds: body.moduleIds ?? [],
     });
     return { status: "success" };
   } catch (error) {

@@ -6,9 +6,9 @@ import { members, planningGroups, projects, workItems, type WorkflowDb } from "@
  * (`apps/admin-ui/src/domain/seed.ts`: members m1-m6, projects p1-p3), not a separate fake dataset.
  * This is what makes the admin-ui <-> backend connection real: admin-ui replaces its local
  * projects/members/workItems with this exact data on load (see `state/store.tsx`), so both sides
- * agree on identity. `cycleId`/`moduleIds` stay backend-only for now — admin-ui's write-back
- * (`domain/backendApi.ts`) deliberately never touches those two fields, so this milestone linkage
- * (used by W10) survives admin-ui edits to the same items.
+ * agree on identity. `cycleId`/`moduleIds` seeded here are just a starting point — admin-ui's own
+ * Planning UI (Sprints/Modules) and a workflow's Update Work Item node can both change them afterward
+ * (last write wins, see adminUiSync.ts).
  */
 const OLD_DEMO_PROJECT_IDS = ["proj-pms", "proj-eng"];
 

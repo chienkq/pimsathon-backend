@@ -66,7 +66,7 @@ export async function runWorkflow(
   trigger: "schedule" | "webhook" | "manual",
   /** Only connector-sync workflows (e.g. W1 Jira Sync) touch `connector_status` — rule workflows like W11 don't. */
   connectorProvider?: string,
-): Promise<WorkflowExecutionResult> {
+): Promise<WorkflowExecutionResult & { runId: string }> {
   const runId = crypto.randomUUID();
   await db.insert(workflowRuns).values({ id: runId, workflowId: workflow.id, status: "running", trigger });
 
@@ -90,7 +90,7 @@ export async function runWorkflow(
           set: { lastSyncAt: new Date(), lastSuccess: result.status === "success", lastError: null },
         });
     }
-    return result;
+    return { ...result, runId };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     await db

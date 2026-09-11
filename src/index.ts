@@ -17,6 +17,7 @@ import {
   pullRequests,
   repositories,
   widgets,
+  workflowRuns,
   workItems,
 } from "@chienkq/workflow-db";
 import { and, desc, eq, inArray } from "drizzle-orm";
@@ -236,13 +237,46 @@ app.post("/api/workflows/:id/run", async (request, reply) => {
       return reply.code(502).send({
         status: result.status,
         nodeResults: result.nodeResults,
+        runId: result.runId,
         error: "Workflow run finished with a node error — see nodeResults for details.",
       });
     }
-    return { status: result.status, nodeResults: result.nodeResults };
+    return { status: result.status, nodeResults: result.nodeResults, runId: result.runId };
   } catch (error) {
     return reply.code(500).send({ status: "error", error: error instanceof Error ? error.message : String(error) });
   }
+});
+
+// Run history for the editor's Run Logs panel — every `runWorkflow` call (scheduled, webhook, or
+// manual) already writes a row to `workflow_runs`, this just exposes it. List omits `output` (can
+// be large and isn't needed for the row view); detail includes it for the timeline.
+app.get("/api/workflows/:id/runs", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const rows = await db
+    .select({
+      id: workflowRuns.id,
+      status: workflowRuns.status,
+      trigger: workflowRuns.trigger,
+      startedAt: workflowRuns.startedAt,
+      finishedAt: workflowRuns.finishedAt,
+      error: workflowRuns.error,
+    })
+    .from(workflowRuns)
+    .where(eq(workflowRuns.workflowId, id))
+    .orderBy(desc(workflowRuns.startedAt))
+    .limit(50);
+  return { runs: rows };
+});
+
+app.get("/api/workflows/:id/runs/:runId", async (request, reply) => {
+  const { id, runId } = request.params as { id: string; runId: string };
+  const [row] = await db
+    .select()
+    .from(workflowRuns)
+    .where(and(eq(workflowRuns.workflowId, id), eq(workflowRuns.id, runId)))
+    .limit(1);
+  if (!row) return reply.code(404).send({ error: `Unknown run: ${runId}` });
+  return { run: { ...row, nodeResults: row.output ?? {} } };
 });
 
 // Real inbound webhook receiver — the `webhook` node reads `services.webhookRequest` (see
@@ -273,10 +307,11 @@ app.all("/api/webhooks/:workflowId", async (request, reply) => {
       return reply.code(502).send({
         status: result.status,
         nodeResults: result.nodeResults,
+        runId: result.runId,
         error: "Workflow run finished with a node error — see nodeResults for details.",
       });
     }
-    return { status: result.status, nodeResults: result.nodeResults };
+    return { status: result.status, nodeResults: result.nodeResults, runId: result.runId };
   } catch (error) {
     return reply.code(500).send({ status: "error", error: error instanceof Error ? error.message : String(error) });
   }

@@ -21,6 +21,9 @@ function toDomain(row: WorkItemRow, projectCode: string): PlatformWorkItem {
     dueDate: row.dueDate,
     cycleId: row.cycleId,
     moduleIds: row.moduleIds,
+    storyPoints: row.storyPoints ?? undefined,
+    externalProvider: row.externalProvider ?? undefined,
+    externalKey: row.externalKey ?? undefined,
   };
 }
 
@@ -28,6 +31,8 @@ const FILTER_COLUMNS = {
   projectId: workItems.projectId,
   status: workItems.status,
   priority: workItems.priority,
+  externalProvider: workItems.externalProvider,
+  externalKey: workItems.externalKey,
 } as const;
 
 /**

@@ -1,4 +1,4 @@
-import type { NormalizedWorkItemFact } from "@chienkq/workflow-core";
+import type { NormalizedTicket } from "@chienkq/workflow-core";
 import * as XLSX from "xlsx";
 
 /**
@@ -68,13 +68,13 @@ function findHeaderRow(sheet: XLSX.WorkSheet, range: { s: XLSX.CellAddress; e: X
 }
 
 export interface JiraExcelImportResult {
-  facts: NormalizedWorkItemFact[];
+  tickets: NormalizedTicket[];
   skipped: number;
 }
 
 /**
- * Parses a Jira Excel export (.xlsx/.xls/.csv) into the same `NormalizedWorkItemFact` shape the live
- * Jira sync workflow produces (see workflow-core's `factUpsert` node), using `provider: "jira"` and
+ * Parses a Jira Excel export (.xlsx/.xls/.csv) into the same `NormalizedTicket` shape the live
+ * Jira sync workflow produces (see workflow-core's `ticketUpsert` node), using `provider: "jira"` and
  * `externalId`/`externalKey` = the issue key so an imported row merges with a live-synced one for the
  * same issue instead of duplicating it.
  */
@@ -102,7 +102,7 @@ export function parseJiraExcelImport(buffer: Buffer): JiraExcelImportResult {
   const keyColumn = columns.key!;
   const titleColumn = columns.title!;
 
-  const facts: NormalizedWorkItemFact[] = [];
+  const tickets: NormalizedTicket[] = [];
   let skipped = 0;
 
   for (const row of rows) {
@@ -120,7 +120,7 @@ export function parseJiraExcelImport(buffer: Buffer): JiraExcelImportResult {
         ? Number(storyPointsRaw)
         : undefined;
 
-    facts.push({
+    tickets.push({
       provider: "jira",
       externalId: key,
       externalKey: key,
@@ -135,5 +135,5 @@ export function parseJiraExcelImport(buffer: Buffer): JiraExcelImportResult {
     });
   }
 
-  return { facts, skipped };
+  return { tickets, skipped };
 }

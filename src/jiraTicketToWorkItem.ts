@@ -1,4 +1,4 @@
-import type { NormalizedWorkItemFact } from "@chienkq/workflow-core";
+import type { NormalizedTicket } from "@chienkq/workflow-core";
 import { projects, workItems, type WorkflowDb } from "@chienkq/workflow-db";
 import { and, eq, sql } from "drizzle-orm";
 
@@ -53,10 +53,10 @@ async function ensureProject(db: WorkflowDb, projectKey: string): Promise<typeof
 }
 
 /**
- * Converts a user-selected set of Jira facts (`work_item_facts`) into real platform work items — a
+ * Converts a user-selected set of Jira tickets (`tickets`) into real platform work items — a
  * deliberate action from the "Jira data" dialog (select rows, hit Convert), not automatic on
  * import/sync, since not every synced Jira issue necessarily belongs on this app's board. Idempotent —
- * matched on (externalProvider, externalKey), so re-converting an already-converted fact updates its
+ * matched on (externalProvider, externalKey), so re-converting an already-converted ticket updates its
  * work item rather than creating a duplicate.
  *
  * `targetProjectId`, when given, is the admin-ui project the user was viewing when they hit Convert —
@@ -64,28 +64,28 @@ async function ensureProject(db: WorkflowDb, projectKey: string): Promise<typeof
  * it, falls back to auto-creating/matching a project by Jira project key (`code`), which put converted
  * items in a project the user wasn't looking at and made them appear to "disappear".
  */
-export async function convertFactsToWorkItems(
+export async function convertTicketsToWorkItems(
   db: WorkflowDb,
-  facts: NormalizedWorkItemFact[],
+  ticketsToConvert: NormalizedTicket[],
   targetProjectId?: string,
 ): Promise<{ created: number; updated: number }> {
   let created = 0;
   let updated = 0;
 
-  for (const fact of facts) {
+  for (const ticket of ticketsToConvert) {
     const project = targetProjectId
       ? { id: targetProjectId }
-      : await ensureProject(db, fact.projectKey);
+      : await ensureProject(db, ticket.projectKey);
     const [existing] = await db
       .select({ id: workItems.id, projectId: workItems.projectId })
       .from(workItems)
-      .where(and(eq(workItems.externalProvider, fact.provider), eq(workItems.externalKey, fact.externalKey)));
+      .where(and(eq(workItems.externalProvider, ticket.provider), eq(workItems.externalKey, ticket.externalKey)));
 
     const patch = {
-      title: fact.title,
-      status: mapStatus(fact.status),
-      priority: mapPriority(fact.priority),
-      description: fact.assignee ? `Imported from Jira (${fact.externalKey}). Assignee: ${fact.assignee}.` : `Imported from Jira (${fact.externalKey}).`,
+      title: ticket.title,
+      status: mapStatus(ticket.status),
+      priority: mapPriority(ticket.priority),
+      description: ticket.assignee ? `Imported from Jira (${ticket.externalKey}). Assignee: ${ticket.assignee}.` : `Imported from Jira (${ticket.externalKey}).`,
     };
 
     if (existing) {
@@ -122,8 +122,8 @@ export async function convertFactsToWorkItems(
       id: crypto.randomUUID(),
       projectId: project.id,
       number,
-      externalProvider: fact.provider,
-      externalKey: fact.externalKey,
+      externalProvider: ticket.provider,
+      externalKey: ticket.externalKey,
       ...patch,
     });
     created += 1;

@@ -4,7 +4,7 @@ import { env } from "./env.js";
 
 export const JIRA_SYNC_WORKFLOW_ID = "w1-jira-sync";
 
-/** W1 from the PM-workflow blueprint, trimmed to its minimal viable shape: jira -> factUpsert. */
+/** W1 from the PM-workflow blueprint, trimmed to its minimal viable shape: jira -> ticketUpsert. */
 export function buildJiraSyncWorkflow(): WorkflowDefinition {
   const now = new Date().toISOString();
   return {
@@ -22,14 +22,14 @@ export function buildJiraSyncWorkflow(): WorkflowDefinition {
         parameters: { jqlQuery: env.jiraJqlQuery, maxResults: 100 },
       },
       {
-        id: "factUpsert",
-        type: "factUpsert",
-        name: "Fact Store — Upsert",
+        id: "ticketUpsert",
+        type: "ticketUpsert",
+        name: "Ticket Store — Upsert",
         position: { x: 260, y: 0 },
         parameters: { provider: "jira" },
       },
     ],
-    connections: [{ id: "jira-to-factUpsert", source: "jira", target: "factUpsert" }],
+    connections: [{ id: "jira-to-ticketUpsert", source: "jira", target: "ticketUpsert" }],
   };
 }
 

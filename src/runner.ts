@@ -1,11 +1,13 @@
 import {
   executeWorkflow,
   type AlertStoreService,
-  type FactStoreService,
+  type AnalysisResultStoreService,
+  type TicketStoreService,
   type GitCacheStoreService,
   type GitClientService,
   type JiraClientService,
   type PlanningGroupStoreService,
+  type WebhookRequestPayload,
   type WidgetStoreService,
   type WorkflowDefinition,
   type WorkflowExecutionResult,
@@ -26,13 +28,16 @@ export async function resolveWorkflow(source: WorkflowSource): Promise<WorkflowD
 /** The full service bag, passed to every workflow run — a node just ignores the keys it doesn't ask for. */
 export interface RunnerServices {
   jiraClient: JiraClientService;
-  factStore: FactStoreService;
+  ticketStore: TicketStoreService;
   alertStore: AlertStoreService;
   workItemStore: WorkItemStoreService;
   widgetStore: WidgetStoreService;
   planningGroupStore: PlanningGroupStoreService;
   gitClient: GitClientService;
   gitCacheStore: GitCacheStoreService;
+  analysisResultStore: AnalysisResultStoreService;
+  /** Only set for a run triggered by a real inbound webhook call — see `/api/webhooks/:workflowId` in index.ts. */
+  webhookRequest?: WebhookRequestPayload;
 }
 
 /** Idempotent — call once at startup so `workflow_runs`'s FK to `workflows` always has a target row. */

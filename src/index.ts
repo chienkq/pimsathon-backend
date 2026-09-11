@@ -24,6 +24,7 @@ import Fastify from "fastify";
 import cors from "@fastify/cors";
 import multipart from "@fastify/multipart";
 import { createAlertStore } from "./alertStore.js";
+import { createAnalysisResultStore } from "./analysisResultStore.js";
 import {
   deletePlanningGroupFromAdminUi,
   deleteWorkItemFromAdminUi,
@@ -34,13 +35,13 @@ import {
 } from "./adminUiSync.js";
 import { createCredentialStore } from "./credentialStore.js";
 import { env } from "./env.js";
-import { createFactStore } from "./factStore.js";
+import { createTicketStore } from "./ticketStore.js";
 import { createGitCacheStore } from "./gitCacheStore.js";
 import { createGitClientFromCredentials } from "./githubClient.js";
 import { createGmailClient } from "./gmailClient.js";
 import { createJiraClientFromCredentials } from "./jiraClient.js";
 import { parseJiraExcelImport } from "./jiraExcelImport.js";
-import { convertFactsToWorkItems } from "./jiraFactToWorkItem.js";
+import { convertTicketsToWorkItems } from "./jiraTicketToWorkItem.js";
 import { createJiraImportJobStore } from "./jiraImportJobs.js";
 import { createOutlookClient } from "./outlookClient.js";
 import { ensureWorkflowRow, resolveWorkflow, runWorkflow, type RunnerServices } from "./runner.js";
@@ -63,6 +64,12 @@ import {
   MILESTONE_TRACKER_WORKFLOW_ID,
   TEAM_WORKLOAD_WORKFLOW_ID,
 } from "./seedWorkflow.js";
+import {
+  ANALYZE_CYCLE_WORKFLOW_ID,
+  ANALYZE_MODULE_WORKFLOW_ID,
+  buildAnalyzeCycleWorkflow,
+  buildAnalyzeModuleWorkflow,
+} from "./seedAnalyzeWorkflows.js";
 import { createPlanningGroupStore } from "./planningGroupStore.js";
 import { getProjectHealth } from "./projectHealth.js";
 import { createWidgetStore } from "./widgetStore.js";
@@ -74,13 +81,14 @@ const credentialStore = createCredentialStore(db);
 const jiraImportJobs = createJiraImportJobStore();
 const services: RunnerServices = {
   jiraClient: createJiraClientFromCredentials(credentialStore),
-  factStore: createFactStore(db),
+  ticketStore: createTicketStore(db),
   alertStore: createAlertStore(db),
   workItemStore: createWorkItemStore(db),
   widgetStore: createWidgetStore(db),
   planningGroupStore: createPlanningGroupStore(db),
   gitClient: createGitClientFromCredentials(credentialStore),
   gitCacheStore: createGitCacheStore(db),
+  analysisResultStore: createAnalysisResultStore(db),
 };
 
 await seedPlatformData(db);
@@ -111,6 +119,16 @@ const registeredWorkflows = {
     cron: "0 */2 * * *",
     connectorProvider: undefined,
   },
+  [ANALYZE_CYCLE_WORKFLOW_ID]: {
+    workflow: buildAnalyzeCycleWorkflow(),
+    cron: "0 */2 * * *",
+    connectorProvider: undefined,
+  },
+  [ANALYZE_MODULE_WORKFLOW_ID]: {
+    workflow: buildAnalyzeModuleWorkflow(),
+    cron: "0 */2 * * *",
+    connectorProvider: undefined,
+  },
 } as const;
 
 for (const { workflow, cron, connectorProvider } of Object.values(registeredWorkflows)) {
@@ -122,7 +140,7 @@ const app = Fastify({ logger: true });
 
 // Dev-only permissive CORS — admin-ui (Vite, a different origin/port) calls this API directly from
 // the browser. Tighten to an explicit allowlist before this backend is ever exposed beyond localhost.
-await app.register(cors, { origin: true });
+await app.register(cors, { origin: true, methods: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"] });
 await app.register(multipart, { limits: { fileSize: 20 * 1024 * 1024 } });
 
 app.get("/health", async () => ({ status: "ok" }));
@@ -208,6 +226,43 @@ app.post("/api/workflows/:id/run", async (request, reply) => {
   try {
     if (adHocWorkflow) await ensureWorkflowRow(db, adHocWorkflow);
     const result = await runWorkflow(db, workflow, services, "manual", entry?.connectorProvider);
+    if (result.status === "error") {
+      return reply.code(502).send({
+        status: result.status,
+        nodeResults: result.nodeResults,
+        error: "Workflow run finished with a node error — see nodeResults for details.",
+      });
+    }
+    return { status: result.status, nodeResults: result.nodeResults };
+  } catch (error) {
+    return reply.code(500).send({ status: "error", error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+// Real inbound webhook receiver — the `webhook` node reads `services.webhookRequest` (see
+// nodeTypes/webhook.ts) when present instead of its old always-simulated shape. Looked up the same
+// way `/api/workflows/:id/run` resolves a workflow (registered built-ins ensured into `workflows` at
+// startup, or a user-authored one saved via the CRUD routes) so any workflow — not just a fixed
+// set — can receive a real Jira/GitHub webhook just by having a `webhook` node and being saved/active.
+app.all("/api/webhooks/:workflowId", async (request, reply) => {
+  const { workflowId } = request.params as { workflowId: string };
+  const entry = (registeredWorkflows as Record<string, (typeof registeredWorkflows)[keyof typeof registeredWorkflows]>)[
+    workflowId
+  ];
+  const workflow = (entry ? await resolveWorkflow(entry.workflow) : undefined) ?? (await workflowStore.get(workflowId));
+  if (!workflow) return reply.code(404).send({ error: `Unknown workflow: ${workflowId}` });
+
+  const webhookRequest = {
+    path: request.url,
+    method: request.method,
+    headers: request.headers as Record<string, string>,
+    query: request.query as Record<string, unknown>,
+    body: request.body,
+    receivedAt: new Date().toISOString(),
+  };
+
+  try {
+    const result = await runWorkflow(db, workflow, { ...services, webhookRequest }, "webhook", entry?.connectorProvider);
     if (result.status === "error") {
       return reply.code(502).send({
         status: result.status,
@@ -492,11 +547,11 @@ app.post("/api/integrations/:provider/test", async (request, reply) => {
 
 // Jira Excel import — an alternative to the live `/rest/api/3/search` sync (W1) for teams that export
 // their Jira board to Excel instead of granting API access, surfaced from the Work Items screen. Rows
-// are normalized to the same shape as the live sync and upserted into `work_item_facts` keyed by issue
+// are normalized to the same shape as the live sync and upserted into `tickets` keyed by issue
 // key, so a re-import or a later live sync of the same issues updates the existing row rather than
 // duplicating it. Parsing + upserting a real export runs in the background (see jiraImportJobs.ts) —
 // this route only reads the upload and returns a job id; the client polls the route below for status.
-app.post("/api/work-item-facts/import-excel", async (request, reply) => {
+app.post("/api/tickets/import-excel", async (request, reply) => {
   const file = await request.file();
   if (!file) return reply.code(400).send({ error: "No file uploaded." });
 
@@ -510,8 +565,8 @@ app.post("/api/work-item-facts/import-excel", async (request, reply) => {
   const job = jiraImportJobs.create();
   setImmediate(async () => {
     try {
-      const { facts, skipped } = parseJiraExcelImport(buffer);
-      await services.factStore.upsertWorkItems(facts);
+      const { tickets, skipped } = parseJiraExcelImport(buffer);
+      await services.ticketStore.upsertTickets(tickets);
       await db
         .insert(connectorStatus)
         .values({ provider: "jira", lastSyncAt: new Date(), lastSuccess: true, lastError: null })
@@ -519,7 +574,7 @@ app.post("/api/work-item-facts/import-excel", async (request, reply) => {
           target: connectorStatus.provider,
           set: { lastSyncAt: new Date(), lastSuccess: true, lastError: null },
         });
-      jiraImportJobs.complete(job.id, { imported: facts.length, skipped });
+      jiraImportJobs.complete(job.id, { imported: tickets.length, skipped });
     } catch (error) {
       jiraImportJobs.fail(job.id, error instanceof Error ? error.message : String(error));
     }
@@ -528,22 +583,22 @@ app.post("/api/work-item-facts/import-excel", async (request, reply) => {
   return reply.code(202).send(job);
 });
 
-app.get("/api/work-item-facts/import-excel/:jobId", async (request, reply) => {
+app.get("/api/tickets/import-excel/:jobId", async (request, reply) => {
   const { jobId } = request.params as { jobId: string };
   const job = jiraImportJobs.get(jobId);
   if (!job) return reply.code(404).send({ error: "Unknown import job." });
   return job;
 });
 
-// Backs the Jira data view on the Work Items screen — facts written by both the live sync (W1) and the
+// Backs the Jira data view on the Work Items screen — tickets written by both the live sync (W1) and the
 // Excel import above, merged by issue key.
-app.get("/api/work-item-facts", async (request) => {
+app.get("/api/tickets", async (request) => {
   const { provider, projectKey, status, priority, assignee } = request.query as Record<string, string | undefined>;
-  const items = await services.factStore.queryWorkItems({ provider, projectKey, status, priority, assignee });
+  const items = await services.ticketStore.queryTickets({ provider, projectKey, status, priority, assignee });
   if (items.length === 0) return { items };
 
-  // Tags each fact with the work item it was already converted to (if any), matched the same way
-  // convertFactsToWorkItems() matches — on (externalProvider, externalKey) — so the "Jira data" table
+  // Tags each ticket with the work item it was already converted to (if any), matched the same way
+  // convertTicketsToWorkItems() matches — on (externalProvider, externalKey) — so the "Jira data" table
   // can show a Converted/Not converted status instead of the user having to guess and re-click Convert.
   const converted = await db
     .select({ id: workItems.id, provider: workItems.externalProvider, key: workItems.externalKey })
@@ -567,20 +622,20 @@ app.get("/api/work-item-facts", async (request) => {
   };
 });
 
-// Converting a Jira fact into a real platform work item is a deliberate, user-picked action (not
+// Converting a Jira ticket into a real platform work item is a deliberate, user-picked action (not
 // automatic on import/sync) — the Jira data dialog lets the user select which rows to convert. Matched
-// on (provider, externalKey) via jiraFactToWorkItem.ts, so re-converting an already-converted fact
+// on (provider, externalKey) via jiraTicketToWorkItem.ts, so re-converting an already-converted ticket
 // updates its work item rather than duplicating it.
-app.post("/api/work-item-facts/convert-to-work-items", async (request, reply) => {
+app.post("/api/tickets/convert-to-work-items", async (request, reply) => {
   const { ids, projectId } = (request.body as { ids?: string[]; projectId?: string } | undefined) ?? {};
   if (!ids || ids.length === 0) return reply.code(400).send({ error: "Body must include a non-empty `ids` array." });
 
-  const allFacts = await services.factStore.queryWorkItems({});
+  const allTickets = await services.ticketStore.queryTickets({});
   const idSet = new Set(ids);
-  const facts = allFacts.filter((fact) => idSet.has(fact.id));
-  if (facts.length === 0) return reply.code(404).send({ error: "No matching facts found." });
+  const tickets = allTickets.filter((ticket) => idSet.has(ticket.id));
+  if (tickets.length === 0) return reply.code(404).send({ error: "No matching tickets found." });
 
-  const { created, updated } = await convertFactsToWorkItems(db, facts, projectId);
+  const { created, updated } = await convertTicketsToWorkItems(db, tickets, projectId);
   return { status: "success", created, updated };
 });
 

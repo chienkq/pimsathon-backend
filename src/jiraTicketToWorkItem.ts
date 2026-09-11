@@ -1,5 +1,5 @@
 import type { NormalizedTicket } from "@chienkq/workflow-core";
-import { projects, workItems, type WorkflowDb } from "@chienkq/workflow-db";
+import { projects, ticketSyncConflicts, workItems, type WorkflowDb } from "@chienkq/workflow-db";
 import { and, eq, sql } from "drizzle-orm";
 
 const STATUS_ALIASES: Record<string, "Todo" | "In Progress" | "In Review" | "Done" | "Cancelled"> = {
@@ -52,6 +52,67 @@ async function ensureProject(db: WorkflowDb, projectKey: string): Promise<typeof
   return created;
 }
 
+/** The three `work_items` fields that are actually a 1:1 mirror of a Jira field — everything else
+ *  (description, labels, etc.) is either synthesized or has no Jira-side equivalent to merge against. */
+interface TicketMergeSnapshot {
+  title: string;
+  status: "Todo" | "In Progress" | "In Review" | "Done" | "Cancelled";
+  priority: "Low" | "Medium" | "High" | "Urgent";
+}
+
+interface TicketFieldConflict {
+  field: keyof TicketMergeSnapshot;
+  appValue: string;
+  jiraValue: string;
+}
+
+interface TicketMergeResult {
+  /** Only the fields safe to write — omits anything left unresolved as a conflict. */
+  patch: Partial<TicketMergeSnapshot>;
+  /** The new "last known Jira value" snapshot to persist as `externalSyncBase`. */
+  newBase: TicketMergeSnapshot;
+  conflicts: TicketFieldConflict[];
+}
+
+/**
+ * Three-way merge (local `work_items` value vs incoming Jira value vs `base` — the Jira value as of
+ * the last successful sync) so re-converting an already-linked ticket doesn't blindly overwrite a
+ * local edit with whatever Jira currently has. No `base` yet means this is the first-ever sync for
+ * this work item, so there's nothing to compare against — just adopt the Jira value.
+ */
+function mergeTicketFields(
+  local: TicketMergeSnapshot,
+  remote: TicketMergeSnapshot,
+  base: TicketMergeSnapshot | null,
+): TicketMergeResult {
+  if (!base) return { patch: { ...remote }, newBase: { ...remote }, conflicts: [] };
+
+  const patch: Partial<TicketMergeSnapshot> = {};
+  const newBase: TicketMergeSnapshot = { ...base };
+  const conflicts: TicketFieldConflict[] = [];
+
+  for (const field of Object.keys(remote) as (keyof TicketMergeSnapshot)[]) {
+    const localValue = local[field];
+    const remoteValue = remote[field];
+    const baseValue = base[field];
+
+    if (localValue === remoteValue) {
+      newBase[field] = remoteValue as never;
+    } else if (localValue === baseValue) {
+      // Only Jira changed since the last sync — safe to apply.
+      patch[field] = remoteValue as never;
+      newBase[field] = remoteValue as never;
+    } else if (remoteValue === baseValue) {
+      // Only the app changed since the last sync — keep the local edit, Jira hasn't moved.
+    } else {
+      // Both sides changed the same field to different values — can't resolve automatically.
+      conflicts.push({ field, appValue: String(localValue), jiraValue: String(remoteValue) });
+    }
+  }
+
+  return { patch, newBase, conflicts };
+}
+
 /**
  * Converts a user-selected set of Jira tickets (`tickets`) into real platform work items — a
  * deliberate action from the "Jira data" dialog (select rows, hit Convert), not automatic on
@@ -77,18 +138,33 @@ export async function convertTicketsToWorkItems(
       ? { id: targetProjectId }
       : await ensureProject(db, ticket.projectKey);
     const [existing] = await db
-      .select({ id: workItems.id, projectId: workItems.projectId })
+      .select({
+        id: workItems.id,
+        projectId: workItems.projectId,
+        title: workItems.title,
+        status: workItems.status,
+        priority: workItems.priority,
+        externalSyncBase: workItems.externalSyncBase,
+      })
       .from(workItems)
       .where(and(eq(workItems.externalProvider, ticket.provider), eq(workItems.externalKey, ticket.externalKey)));
 
-    const patch = {
-      title: ticket.title,
-      status: mapStatus(ticket.status),
-      priority: mapPriority(ticket.priority),
-      description: ticket.assignee ? `Imported from Jira (${ticket.externalKey}). Assignee: ${ticket.assignee}.` : `Imported from Jira (${ticket.externalKey}).`,
-    };
+    const description = ticket.assignee
+      ? `Imported from Jira (${ticket.externalKey}). Assignee: ${ticket.assignee}.`
+      : `Imported from Jira (${ticket.externalKey}).`;
 
     if (existing) {
+      const remote: TicketMergeSnapshot = {
+        title: ticket.title,
+        status: mapStatus(ticket.status),
+        priority: mapPriority(ticket.priority),
+      };
+      const merge = mergeTicketFields(
+        { title: existing.title, status: existing.status, priority: existing.priority },
+        remote,
+        existing.externalSyncBase as TicketMergeSnapshot | null,
+      );
+
       // Re-converting moves the item to `targetProjectId` too, not just refreshing its fields — earlier
       // conversions could have landed under an auto-created project (before targetProjectId existed, or
       // when the user picked a different project that time), which otherwise leaves it stuck out of view.
@@ -105,8 +181,24 @@ export async function convertTicketsToWorkItems(
       }
       await db
         .update(workItems)
-        .set({ ...patch, ...movePatch, updatedAt: new Date() })
+        .set({ ...merge.patch, description, externalSyncBase: merge.newBase, ...movePatch, updatedAt: new Date() })
         .where(eq(workItems.id, existing.id));
+
+      // Fully replace this work item's conflict set with what this run found — a field that resolved
+      // itself (e.g. the app was edited back to match Jira) shouldn't leave a stale conflict row behind.
+      await db.delete(ticketSyncConflicts).where(eq(ticketSyncConflicts.workItemId, existing.id));
+      if (merge.conflicts.length > 0) {
+        await db.insert(ticketSyncConflicts).values(
+          merge.conflicts.map((c) => ({
+            id: crypto.randomUUID(),
+            workItemId: existing.id,
+            field: c.field,
+            appValue: c.appValue,
+            jiraValue: c.jiraValue,
+          })),
+        );
+      }
+
       updated += 1;
       continue;
     }
@@ -118,13 +210,21 @@ export async function convertTicketsToWorkItems(
       .returning();
     const number = updatedProject.nextNumber - 1;
 
+    const firstSyncBase: TicketMergeSnapshot = {
+      title: ticket.title,
+      status: mapStatus(ticket.status),
+      priority: mapPriority(ticket.priority),
+    };
+
     await db.insert(workItems).values({
       id: crypto.randomUUID(),
       projectId: project.id,
       number,
       externalProvider: ticket.provider,
       externalKey: ticket.externalKey,
-      ...patch,
+      description,
+      ...firstSyncBase,
+      externalSyncBase: firstSyncBase,
     });
     created += 1;
   }

@@ -36,6 +36,7 @@ import {
 import { createCredentialStore } from "./credentialStore.js";
 import { env } from "./env.js";
 import { createTicketStore } from "./ticketStore.js";
+import { createTicketSyncConflictStore } from "./ticketSyncConflictStore.js";
 import { createGitCacheStore } from "./gitCacheStore.js";
 import { createGitClientFromCredentials } from "./githubClient.js";
 import { createGmailClient } from "./gmailClient.js";
@@ -79,6 +80,7 @@ const db = createDb(env.databaseUrl);
 const workflowStore = createWorkflowStore(db);
 const credentialStore = createCredentialStore(db);
 const jiraImportJobs = createJiraImportJobStore();
+const ticketSyncConflictStore = createTicketSyncConflictStore(db);
 const services: RunnerServices = {
   jiraClient: createJiraClientFromCredentials(credentialStore),
   ticketStore: createTicketStore(db),
@@ -132,7 +134,7 @@ const registeredWorkflows = {
 } as const;
 
 for (const { workflow, cron, connectorProvider } of Object.values(registeredWorkflows)) {
-  await ensureWorkflowRow(db, await resolveWorkflow(workflow));
+  await ensureWorkflowRow(db, await resolveWorkflow(workflow), /* isSystem */ true);
   scheduleWorkflow(db, workflow, cron, services, connectorProvider);
 }
 
@@ -182,10 +184,14 @@ app.put("/api/workflows/:id", async (request, reply) => {
   }
 });
 
-app.delete("/api/workflows/:id", async (request) => {
+app.delete("/api/workflows/:id", async (request, reply) => {
   const { id } = request.params as { id: string };
-  await workflowStore.remove(id);
-  return { status: "success" };
+  try {
+    await workflowStore.remove(id);
+    return { status: "success" };
+  } catch (error) {
+    return reply.code(403).send({ error: error instanceof Error ? error.message : String(error) });
+  }
 });
 
 app.post("/api/workflows/:id/duplicate", async (request, reply) => {
@@ -637,6 +643,28 @@ app.post("/api/tickets/convert-to-work-items", async (request, reply) => {
 
   const { created, updated } = await convertTicketsToWorkItems(db, tickets, projectId);
   return { status: "success", created, updated };
+});
+
+// Left behind by the three-way merge in convertTicketsToWorkItems() above when both the app and Jira
+// changed the same field since the last sync — surfaced on the Jira Sync screen's "Resolve sync
+// conflicts" card, never auto-resolved.
+app.get("/api/tickets/conflicts", async (request, reply) => {
+  const { projectId } = request.query as Record<string, string | undefined>;
+  if (!projectId) return reply.code(400).send({ error: "Query must include `projectId`." });
+  const conflicts = await ticketSyncConflictStore.listByProject(projectId);
+  return { conflicts };
+});
+
+app.post("/api/tickets/conflicts/:id/resolve", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const { choice } = (request.body as { choice?: "app" | "jira" } | undefined) ?? {};
+  if (choice !== "app" && choice !== "jira") return reply.code(400).send({ error: 'Body must include `choice` of "app" or "jira".' });
+  try {
+    await ticketSyncConflictStore.resolve(id, choice);
+    return { status: "success" };
+  } catch (error) {
+    return reply.code(404).send({ error: error instanceof Error ? error.message : String(error) });
+  }
 });
 
 await app.listen({ port: env.port, host: "0.0.0.0" });

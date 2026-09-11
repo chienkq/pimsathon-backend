@@ -40,8 +40,13 @@ export interface RunnerServices {
   webhookRequest?: WebhookRequestPayload;
 }
 
-/** Idempotent — call once at startup so `workflow_runs`'s FK to `workflows` always has a target row. */
-export async function ensureWorkflowRow(db: WorkflowDb, workflow: WorkflowDefinition): Promise<void> {
+/**
+ * Idempotent — call once at startup so `workflow_runs`'s FK to `workflows` always has a target row.
+ * `isSystem: true` is only for the fixed set of built-in workflows registered in index.ts — it only
+ * takes effect on first insert (`onConflictDoNothing`); a pre-existing row's flag is left as-is, since
+ * the 0011 migration already backfilled `is_system` for their known ids.
+ */
+export async function ensureWorkflowRow(db: WorkflowDb, workflow: WorkflowDefinition, isSystem = false): Promise<void> {
   await db
     .insert(workflows)
     .values({
@@ -49,6 +54,7 @@ export async function ensureWorkflowRow(db: WorkflowDb, workflow: WorkflowDefini
       name: workflow.name,
       definition: workflow as unknown as Record<string, unknown>,
       active: workflow.active,
+      isSystem,
     })
     .onConflictDoNothing({ target: workflows.id });
 }

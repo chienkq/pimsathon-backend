@@ -5,7 +5,10 @@ import { desc, eq } from "drizzle-orm";
 type WorkflowRow = typeof workflows.$inferSelect;
 
 function toDomain(row: WorkflowRow): WorkflowDefinition {
-  return row.definition as unknown as WorkflowDefinition;
+  // `isSystem` lives in its own column, not the `definition` jsonb blob — the editor's save
+  // round-trips only the fields it knows about (see useWorkflowEditorState.buildWorkflowDefinition),
+  // so relying on the jsonb copy would silently lose the flag the first time someone saves the workflow.
+  return { ...(row.definition as unknown as WorkflowDefinition), isSystem: row.isSystem };
 }
 
 /**
@@ -55,6 +58,8 @@ export function createWorkflowStore(db: WorkflowDb): WorkflowRepository {
     },
 
     async remove(id: string) {
+      const [row] = await db.select().from(workflows).where(eq(workflows.id, id));
+      if (row?.isSystem) throw new Error(`Workflow ${id} is a system workflow and cannot be deleted`);
       await db.delete(workflows).where(eq(workflows.id, id));
     },
 
@@ -67,6 +72,8 @@ export function createWorkflowStore(db: WorkflowDb): WorkflowRepository {
         id: crypto.randomUUID(),
         name: `${source.name} (copy)`,
         active: false,
+        // A copy of a system workflow is a regular, deletable workflow — not itself protected.
+        isSystem: false,
         createdAt: now,
         updatedAt: now,
       };
@@ -75,6 +82,7 @@ export function createWorkflowStore(db: WorkflowDb): WorkflowRepository {
         name: copy.name,
         definition: copy as unknown as Record<string, unknown>,
         active: copy.active,
+        isSystem: false,
       });
       return copy;
     },

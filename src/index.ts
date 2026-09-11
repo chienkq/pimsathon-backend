@@ -250,7 +250,7 @@ app.post("/api/workflows/:id/run", async (request, reply) => {
 // Run history for the editor's Run Logs panel — every `runWorkflow` call (scheduled, webhook, or
 // manual) already writes a row to `workflow_runs`, this just exposes it. List omits `output` (can
 // be large and isn't needed for the row view); detail includes it for the timeline.
-app.get("/api/workflows/:id/runs", async (request, reply) => {
+app.get("/api/workflows/:id/runs", async (request) => {
   const { id } = request.params as { id: string };
   const rows = await db
     .select({

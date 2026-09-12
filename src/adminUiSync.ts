@@ -21,6 +21,8 @@ export interface AdminUiWorkItemFields {
   dueDate: string;
   cycleId: string;
   moduleIds: string[];
+  /** Free-text scratchpad AI/humans write to so future AI runs can read a work item's context fast. */
+  aiNote: string;
 }
 
 /**
@@ -45,6 +47,7 @@ export async function upsertWorkItemFromAdminUi(db: WorkflowDb, item: AdminUiWor
         dueDate: item.dueDate,
         cycleId: item.cycleId,
         moduleIds: [...item.moduleIds],
+        aiNote: item.aiNote,
         updatedAt: new Date(),
       },
     });

@@ -14,6 +14,7 @@ export function createAlertStore(db: WorkflowDb): AlertStoreService {
             severity: alert.severity,
             title: alert.title,
             message: alert.message,
+            workItemId: alert.workItemId,
             status: "open",
             updatedAt: new Date(),
           },

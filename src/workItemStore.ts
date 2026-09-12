@@ -24,6 +24,7 @@ function toDomain(row: WorkItemRow, projectCode: string): PlatformWorkItem {
     storyPoints: row.storyPoints ?? undefined,
     externalProvider: row.externalProvider ?? undefined,
     externalKey: row.externalKey ?? undefined,
+    aiNote: row.aiNote ?? undefined,
   };
 }
 

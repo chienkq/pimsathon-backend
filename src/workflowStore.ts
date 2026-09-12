@@ -1,6 +1,18 @@
-import { createEmptyWorkflow, toWorkflowSummary, type WorkflowDefinition, type WorkflowRepository } from "@chienkq/workflow-core";
+import {
+  createEmptyWorkflow,
+  toWorkflowSummary,
+  type WorkflowDefinition,
+  type WorkflowNodeDefinition,
+  type WorkflowRepository,
+  type WorkflowSummary,
+} from "@chienkq/workflow-core";
 import { workflows, type WorkflowDb } from "@chienkq/workflow-db";
 import { desc, eq } from "drizzle-orm";
+
+export interface WorkflowStore extends WorkflowRepository {
+  /** Workflows whose first node has the given type — e.g. `"workItem"`, matching the convention every existing seed workflow (W8/W9/W10/W11) already uses for "this workflow's input is a work item". */
+  listByInputNodeType(nodeType: string): Promise<WorkflowSummary[]>;
+}
 
 type WorkflowRow = typeof workflows.$inferSelect;
 
@@ -18,7 +30,7 @@ function toDomain(row: WorkflowRow): WorkflowDefinition {
  * `name`/`active` are kept as their own columns (for listing/filtering) in addition to living inside
  * the `definition` jsonb blob, which stays the single source of truth for the full shape.
  */
-export function createWorkflowStore(db: WorkflowDb): WorkflowRepository {
+export function createWorkflowStore(db: WorkflowDb): WorkflowStore {
   return {
     async list() {
       const rows = await db.select().from(workflows).orderBy(desc(workflows.updatedAt));
@@ -30,8 +42,8 @@ export function createWorkflowStore(db: WorkflowDb): WorkflowRepository {
       return row ? toDomain(row) : undefined;
     },
 
-    async create(name: string) {
-      const workflow = createEmptyWorkflow(name);
+    async create(name: string, initialNodes?: WorkflowNodeDefinition[]) {
+      const workflow = createEmptyWorkflow(name, initialNodes);
       await db.insert(workflows).values({
         id: workflow.id,
         name: workflow.name,
@@ -85,6 +97,14 @@ export function createWorkflowStore(db: WorkflowDb): WorkflowRepository {
         isSystem: false,
       });
       return copy;
+    },
+
+    async listByInputNodeType(nodeType: string) {
+      const rows = await db.select().from(workflows).orderBy(desc(workflows.updatedAt));
+      return rows
+        .map(toDomain)
+        .filter((workflow) => workflow.nodes[0]?.type === nodeType)
+        .map(toWorkflowSummary);
     },
 
     async setActive(id: string, active: boolean) {

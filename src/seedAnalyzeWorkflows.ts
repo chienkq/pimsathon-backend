@@ -2,6 +2,7 @@ import type { WorkflowDefinition } from "@chienkq/workflow-core";
 
 export const ANALYZE_CYCLE_WORKFLOW_ID = "w12-analyze-cycle";
 export const ANALYZE_MODULE_WORKFLOW_ID = "w13-analyze-module";
+export const ANALYZE_WORKITEM_HEALTH_WORKFLOW_ID = "w14-analyze-workitem-health";
 
 /**
  * Rule-based health computation, shared shape between Analyze Cycle and Analyze Module (see
@@ -137,6 +138,121 @@ export function buildAnalyzeCycleWorkflow(): WorkflowDefinition {
       // Fan out from the assembled result, not chained through Save first — `analysisResultSave`'s
       // output is the canonical stored row (id/subjectId/status/...), which drops fields like `name`
       // that only the pre-save item had and that the alert's title template still needs.
+      { id: "assemble-to-save", source: "assembleResult", target: "saveResult" },
+      { id: "assemble-to-if", source: "assembleResult", target: "needsAlert" },
+      { id: "if-to-alert", source: "needsAlert", target: "raiseAlert", sourceOutput: "true" },
+    ],
+  };
+}
+
+/** Per-item health computation for one work item — no aggregation across children, unlike Cycle/Module. */
+const COMPUTE_WORKITEM_HEALTH = `
+const today = new Date().toISOString().slice(0, 10);
+
+return items
+  .filter((item) => item.json.status !== "Cancelled")
+  .map((item) => {
+    const overdue = Boolean(item.json.dueDate) && item.json.dueDate < today && item.json.status !== "Done";
+    const staleUrgent = item.json.status !== "Done" && !item.json.dueDate && item.json.priority === "Urgent";
+
+    const risks = [];
+    if (overdue) risks.push({ title: \`Past due date (\${item.json.dueDate})\`, relatedWorkItemIds: [item.json.id] });
+    if (staleUrgent) risks.push({ title: "Urgent priority with no due date set" });
+
+    let status = "on_track";
+    if (overdue) status = "off_track";
+    else if (staleUrgent) status = "at_risk";
+
+    const healthScore = item.json.status === "Done" ? 100 : overdue ? 20 : staleUrgent ? 60 : 90;
+    const needsAlert = status !== "on_track";
+    const recommendedActions = [];
+    if (overdue) recommendedActions.push("Re-prioritize or escalate this item");
+    if (staleUrgent) recommendedActions.push("Set a due date and confirm the owner");
+
+    return {
+      json: {
+        subjectId: item.json.id,
+        key: item.json.key,
+        title: item.json.title,
+        status,
+        healthScore,
+        risks,
+        completionDate: item.json.dueDate || undefined,
+        recommendedActions,
+        needsAlert,
+        alertSeverity: status === "off_track" ? "high" : status === "at_risk" ? "medium" : "low",
+      },
+    };
+  });
+`.trim();
+
+const AI_PROMPT_WORKITEM = `
+return items.map((item) => ({
+  json: {
+    ...item.json,
+    aiMessage: \`Work item "\${item.json.key} — \${item.json.title}" is currently \${item.json.status.replace("_", " ")}. Assess its health and suggest actions.\`,
+  },
+}));
+`.trim();
+
+const ASSEMBLE_WORKITEM_RESULT = `
+return items.map((item) => ({
+  json: {
+    ...item.json,
+    summary: \`\${item.json.status.replace("_", " ")} — \${item.json.key}. \${item.json.response ?? ""}\`,
+  },
+}));
+`.trim();
+
+/**
+ * "Analyze Work Item Health" — a per-work-item health check, distinct from Analyze Cycle/Module
+ * (which aggregate across a cycle/module's linked items). workItem(List) -> code (compute health,
+ * one row per item, no aggregation) -> sendMessageToAiAgent (narrative, stub until real AI wiring) ->
+ * code (assemble) -> analysisResultSave(subjectType: "workItem") -> if(needsAlert) -> raiseAlert.
+ * Backs the WorkItem detail panel's Health Status section (see GET /api/work-items/:id/health).
+ */
+export function buildAnalyzeWorkItemHealthWorkflow(): WorkflowDefinition {
+  const now = new Date().toISOString();
+  return {
+    id: ANALYZE_WORKITEM_HEALTH_WORKFLOW_ID,
+    name: "Analyze Work Item Health",
+    active: true,
+    createdAt: now,
+    updatedAt: now,
+    nodes: [
+      { id: "workItem", type: "workItem", name: "Work Item", position: { x: 0, y: 0 }, parameters: { action: "List" } },
+      { id: "computeHealth", type: "code", name: "Compute Work Item Health", position: { x: 260, y: 0 }, parameters: { code: COMPUTE_WORKITEM_HEALTH } },
+      { id: "aiPrompt", type: "code", name: "Build AI Prompt", position: { x: 520, y: 0 }, parameters: { code: AI_PROMPT_WORKITEM } },
+      {
+        id: "aiAgent",
+        type: "sendMessageToAiAgent",
+        name: "Send Message to AI Agent",
+        position: { x: 780, y: 0 },
+        // See the equivalent node in buildAnalyzeCycleWorkflow for why `message` is a fixed string.
+        parameters: { agentName: "workitem-health-analyst", message: "Assess each work item's health and suggest actions." },
+      },
+      { id: "assembleResult", type: "code", name: "Assemble Analysis Result", position: { x: 1040, y: 0 }, parameters: { code: ASSEMBLE_WORKITEM_RESULT } },
+      { id: "saveResult", type: "analysisResultSave", name: "Analysis Result — Save", position: { x: 1300, y: 0 }, parameters: { subjectType: "workItem" } },
+      { id: "needsAlert", type: "if", name: "If: Needs Alert", position: { x: 1560, y: 0 }, parameters: NEEDS_ALERT_IF_PARAMETERS },
+      {
+        id: "raiseAlert",
+        type: "raiseAlert",
+        name: "Raise Alert",
+        position: { x: 1820, y: 0 },
+        parameters: {
+          alertType: "workitem-health",
+          titleTemplate: "Work item at risk: {{key}} ({{status}})",
+          dedupeKeyField: "subjectId",
+          workItemIdField: "subjectId",
+          defaultSeverity: "medium",
+        },
+      },
+    ],
+    connections: [
+      { id: "workItem-to-health", source: "workItem", target: "computeHealth" },
+      { id: "health-to-prompt", source: "computeHealth", target: "aiPrompt" },
+      { id: "prompt-to-agent", source: "aiPrompt", target: "aiAgent" },
+      { id: "agent-to-assemble", source: "aiAgent", target: "assembleResult" },
       { id: "assemble-to-save", source: "assembleResult", target: "saveResult" },
       { id: "assemble-to-if", source: "assembleResult", target: "needsAlert" },
       { id: "if-to-alert", source: "needsAlert", target: "raiseAlert", sourceOutput: "true" },

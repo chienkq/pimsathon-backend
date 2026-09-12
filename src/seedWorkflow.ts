@@ -81,7 +81,13 @@ export function buildAlertEngineWorkflow(): WorkflowDefinition {
         type: "raiseAlert",
         name: "Raise Alert",
         position: { x: 520, y: 0 },
-        parameters: { alertType: "stale-urgent-item", titleTemplate: "{{alertTitle}}", dedupeKeyField: "key", defaultSeverity: "high" },
+        parameters: {
+          alertType: "stale-urgent-item",
+          titleTemplate: "{{alertTitle}}",
+          dedupeKeyField: "key",
+          workItemIdField: "id",
+          defaultSeverity: "high",
+        },
       },
     ],
     connections: [

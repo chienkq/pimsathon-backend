@@ -122,6 +122,37 @@ export function createGitClient(config: { token: string }): GitClientService {
   };
 }
 
+export interface GitHubAccountRepo {
+  owner: string;
+  name: string;
+  defaultBranch: string;
+}
+
+/** Lists every repo the token's account can see (`GET /user/repos`) — used to populate a
+ *  "connect a repository" picker with the account's real repos, not just the single owner/repo
+ *  pinned in the GitHub credential config. */
+export async function listAccountRepositories(token: string): Promise<GitHubAccountRepo[]> {
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    Accept: "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28",
+  };
+  const repos: GitHubAccountRepo[] = [];
+  for (let page = 1; page <= 10; page++) {
+    const response = await fetch(`https://api.github.com/user/repos?per_page=100&page=${page}&sort=full_name`, {
+      headers,
+    });
+    if (!response.ok) {
+      const body = (await response.json().catch(() => ({}))) as GitHubApiError;
+      throw new Error(`GitHub API GET /user/repos failed: ${response.status} ${body.message ?? response.statusText}`);
+    }
+    const data = (await response.json()) as { owner: { login: string }; name: string; default_branch: string }[];
+    repos.push(...data.map((r) => ({ owner: r.owner.login, name: r.name, defaultBranch: r.default_branch })));
+    if (data.length < 100) break;
+  }
+  return repos;
+}
+
 /**
  * `GitClientService` backed by the Integrations screen's stored credential (`credentials` table,
  * provider `github`) instead of a fixed token — looked up fresh on every call so a reconfigure in

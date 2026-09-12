@@ -1,9 +1,9 @@
 import type { AiAgentLlmService, SendMessageToAgentService } from "@chienkq/workflow-core";
-import type { AgentToolStore } from "./agentToolStore.js";
-import type { AiAgentStore } from "./aiAgentStore.js";
+import type { AgentToolStore } from "../../store/agentToolStore.js";
+import type { AiAgentStore } from "../../store/aiAgentStore.js";
 import { runAgentTool } from "./agentToolRunner.js";
-import type { LlmConfigStore } from "./llmConfigStore.js";
-import { completeChat } from "./llmComplete.js";
+import type { LlmConfigStore } from "../../store/llmConfigStore.js";
+import { completeChat } from "../../integrations/llm/llmComplete.js";
 import { runAgent } from "./llmAgentRunner.js";
 
 /** Cap on how much of an input item's JSON gets embedded as prompt context — a git "Read Project

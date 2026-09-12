@@ -1,6 +1,6 @@
 import type { FilterValue, WorkflowDefinition } from "@chienkq/workflow-core";
-import type { CredentialStore } from "./credentialStore.js";
-import { env } from "./env.js";
+import type { CredentialStore } from "../store/credentialStore.js";
+import { env } from "../config/env.js";
 
 export const JIRA_SYNC_WORKFLOW_ID = "w1-jira-sync";
 

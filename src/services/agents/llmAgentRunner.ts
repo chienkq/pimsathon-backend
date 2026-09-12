@@ -1,6 +1,6 @@
 import type { LlmProviderId } from "@chienkq/workflow-core";
-import type { LlmCompleteConfig } from "./llmComplete.js";
-import { completeChat } from "./llmComplete.js";
+import type { LlmCompleteConfig } from "../../integrations/llm/llmComplete.js";
+import { completeChat } from "../../integrations/llm/llmComplete.js";
 
 /** Default cap on how many tool-call round-trips one agent turn may take before it's treated as
  *  stuck — overridable per-agent via `RunAgentOptions.maxToolIterations` (see the AI Agent Edit
@@ -256,7 +256,7 @@ export async function runAgent(options: RunAgentOptions): Promise<AgentRunResult
       let content: string;
       let isError = false;
       try {
-        // eslint-disable-next-line no-await-in-loop -- tool calls in one turn run sequentially so each result is available before the next; OpenAI's message format doesn't need them parallel
+         
         content = toolResultText(await executeTool(tc.name, tc.arguments));
       } catch (error) {
         content = `Error: ${error instanceof Error ? error.message : String(error)}`;

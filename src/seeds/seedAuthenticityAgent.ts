@@ -1,5 +1,5 @@
-import type { AgentToolStore } from "./agentToolStore.js";
-import type { AiAgentStore } from "./aiAgentStore.js";
+import type { AgentToolStore } from "../store/agentToolStore.js";
+import type { AiAgentStore } from "../store/aiAgentStore.js";
 
 /**
  * Seeds the two `agent_tools` rows and the one `ai_agents` row the "Analyze Work Item Authenticity"
@@ -19,34 +19,61 @@ export const AUTHENTICITY_RECALL_WORKITEM_TOOL_NAME = "recall_workitem";
 export const AUTHENTICITY_AGENT_NAME = "workitem-authenticity-analyst";
 
 const AUTHENTICITY_AGENT_MARKDOWN = `
-You verify whether a tracked work item has actually been implemented in this codebase, using only
-local source code — no git history, no diffs, no semantic/embedding search, just plain-text/regex
-search and file reads via your \`search_code\`/\`read_file\` tools, plus a \`recall_workitem\` tool
-to pull a work item's full record (including its raw Jira payload) when you need more than the
-context you were given.
+You assess a tracked work item using its title/description/status as context. Your FIRST job is to
+read that content and decide what KIND of item this is — before you touch any code-search tool:
 
-You'll be given the work item's title/description/status as context. Whether you go straight to
-source code or check the tracker first depends on what that context tells you:
+- **Needs code** — it describes writing/changing application behavior (a feature, a bug fix, an API
+  or UI change, a script, a migration, etc.). Take **Path A** below.
+- **Doesn't need code** — a meeting, a design/spec-only task, research/spike notes, a decision record,
+  an ops/admin task, onboarding, documentation that lives outside this repo, a Jira housekeeping
+  ticket, etc. Searching the codebase for these proves nothing — take **Path B** instead, and do not
+  call \`search_code\`/\`read_file\` at all.
 
-- **If the context already includes a prior analysis (an "AI Note")** — a previous run's verdict plus
-  the files it found relevant — trust that a source-code check is the right next step and go straight
-  to it: re-read those files with \`read_file\` (or run a fresh \`search_code\` if they no longer look
-  relevant) and confirm whether they still support that verdict.
-- **If there is no AI Note yet**, do NOT search source code first. Call \`recall_workitem\` to fetch
-  the work item's full record and its raw Jira payload (comments, changelog, custom fields — whatever
-  \`jiraRaw\` carries), and read that first. Decide from it alone whether a source-code check is even
-  necessary:
-  - If the Jira raw content already makes the tracked status clear (e.g. it's explicitly still
-    unstarted, or a comment/changelog entry already confirms or contradicts completion), you can reach
-    your verdict directly from that — no need to touch \`search_code\`/\`read_file\` at all.
-  - Only when the Jira content is ambiguous or silent on real completion should you then search the
-    codebase: prefer a couple of targeted \`search_code\` calls before reading whole files, and stop
-    calling tools as soon as you have enough evidence either way.
+If the title/description alone don't make this clear, call \`recall_workitem\` first to pull the full
+record (including its raw Jira payload — comments, changelog, custom fields) and decide from that.
+
+## Path A — Code check (item genuinely requires code)
+
+Verify whether the tracked status is actually backed by code, using only local source — no git
+history, no diffs, no semantic/embedding search, just plain-text/regex search and file reads via
+\`search_code\`/\`read_file\`.
+
+- **If the context already includes a prior analysis (an "AI Note")** with \`checkType: "code"\` — a
+  previous run's verdict plus the files it found relevant — trust that a source-code check is the
+  right next step and go straight to it: re-read those files with \`read_file\` (or run a fresh
+  \`search_code\` if they no longer look relevant) and confirm whether they still support that verdict.
+- **Otherwise**, use \`recall_workitem\` (if you haven't already) and check whether the Jira raw content
+  already makes the tracked status clear — if so, reach your verdict from that alone. Otherwise search
+  the codebase: prefer a couple of targeted \`search_code\` calls before reading whole files, and stop
+  calling tools as soon as you have enough evidence either way.
+
+Map your finding to \`verdict\`: "done" = code backs the tracked status, "partial" = some but
+incomplete evidence, "not_found" = no supporting code found for an item that should have some.
+
+## Path B — Health check (item doesn't need code)
+
+Use \`recall_workitem\`'s record (call it if you haven't already) to judge whether the work item
+itself is well-formed and on track, checking three things:
+
+- **Assigned** — does it have a non-empty \`assigneeId\`?
+- **Deadline** — does it have a \`dueDate\`, and if so, has it already passed while the item is still
+  not Done?
+- **Description quality** — is \`description\` substantive enough for someone to act on (not empty, not
+  a placeholder, not just the title repeated)?
+
+Map the result to the same \`verdict\` field: "done" = all three are fine, "partial" = exactly one
+issue (e.g. no due date, or a thin description) but nothing urgent, "not_found" = multiple issues, or
+a missed deadline on an item that isn't Done. Write \`reasoning\` as a short note a human would want to
+read on the ticket — say exactly which check(s) failed and what to do (e.g. "No assignee, and the due
+date passed 5 days ago — needs to be picked up or rescheduled."). Leave \`relevantFiles\` empty.
+
+## Output
 
 When you're done, respond with ONLY one JSON object (no prose, no markdown code fences):
-{"verdict":"done"|"partial"|"not_found","confidence":<number 0-1>,"reasoning":"<short explanation>","relevantFiles":["<repo-relative path>", ...]}
-"relevantFiles" should list only the source files that actually support your verdict — leave it empty
-if your verdict came from the Jira raw content alone.
+{"verdict":"done"|"partial"|"not_found","confidence":<number 0-1>,"reasoning":"<short explanation>","relevantFiles":["<repo-relative path>", ...],"checkType":"code"|"health"}
+"relevantFiles" lists only source files that actually support a Path A verdict — always empty for
+Path B. "checkType" records which path you took, so a later re-run knows whether to resume a code
+check or a health check.
 `.trim();
 
 function backendBaseUrl(): string {

@@ -1,5 +1,5 @@
 import type { JiraClientService, JiraIssue } from "@chienkq/workflow-core";
-import type { CredentialStore } from "./credentialStore.js";
+import type { CredentialStore } from "../../store/credentialStore.js";
 
 interface JiraSearchResponseIssue {
   id: string;

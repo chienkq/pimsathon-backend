@@ -1,6 +1,6 @@
 import type { AnalysisResult, AnalysisResultStoreService, AnalysisSubjectType, StoredAnalysisResult } from "@chienkq/workflow-core";
 import { analysisResults, type WorkflowDb } from "@chienkq/workflow-db";
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, inArray } from "drizzle-orm";
 
 type AnalysisResultRow = typeof analysisResults.$inferSelect;
 
@@ -42,4 +42,26 @@ export function createAnalysisResultStore(db: WorkflowDb): AnalysisResultStoreSe
       return rows.map(toDomain);
     },
   };
+}
+
+/**
+ * The latest `analysis_results` row per subject, for a batch of subject ids of the same type (e.g.
+ * every cycle or module in a project) — one query instead of N, used by the Project Health page.
+ */
+export async function queryLatestForSubjects(
+  db: WorkflowDb,
+  subjectType: AnalysisSubjectType,
+  subjectIds: string[]
+): Promise<StoredAnalysisResult[]> {
+  if (subjectIds.length === 0) return [];
+  const rows = await db
+    .select()
+    .from(analysisResults)
+    .where(and(eq(analysisResults.subjectType, subjectType), inArray(analysisResults.subjectId, subjectIds)))
+    .orderBy(desc(analysisResults.analyzedAt));
+  const latestBySubject = new Map<string, AnalysisResultRow>();
+  for (const row of rows) {
+    if (!latestBySubject.has(row.subjectId)) latestBySubject.set(row.subjectId, row);
+  }
+  return [...latestBySubject.values()].map(toDomain);
 }

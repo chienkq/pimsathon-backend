@@ -2,7 +2,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import type { CredentialStore } from "./credentialStore.js";
+import type { CredentialStore } from "../../store/credentialStore.js";
 
 const execFileAsync = promisify(execFile);
 

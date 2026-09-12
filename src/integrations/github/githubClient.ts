@@ -1,5 +1,5 @@
 import type { GitBranch, GitClientService, GitCommit, GitIssue, GitPullRequest } from "@chienkq/workflow-core";
-import type { CredentialStore } from "./credentialStore.js";
+import type { CredentialStore } from "../../store/credentialStore.js";
 
 interface GitHubApiError {
   message?: string;

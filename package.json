@@ -4,10 +4,10 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "tsx watch src/index.ts",
+    "dev": "tsx watch src/server.ts",
     "dev:fake-jira": "tsx watch src/mocks/fakeJiraServer.ts",
     "build": "tsc",
-    "start": "node dist/index.js",
+    "start": "node dist/server.js",
     "clean": "rm -rf dist .turbo",
     "check:types": "tsc --noEmit"
   },

@@ -1,11 +1,11 @@
 import { EMBEDDING_VECTOR_DIMENSIONS } from "@chienkq/workflow-db";
 import type { CodeIndexService, CodeSearchResult } from "@chienkq/workflow-core";
-import { chunkFile } from "./codeChunker.js";
-import type { CodeIndexStore, EmbeddedCodeChunk } from "./codeIndexStore.js";
-import type { CodeSearchSettingsStore } from "./codeSearchSettingsStore.js";
-import { createEmbeddingClient, type EmbeddingClient } from "./embeddingClient.js";
-import type { LlmConfigStore } from "./llmConfigStore.js";
-import type { LocalGitClient } from "./localGitClient.js";
+import { chunkFile } from "../../lib/codeChunker.js";
+import type { CodeIndexStore, EmbeddedCodeChunk } from "../../store/codeIndexStore.js";
+import type { CodeSearchSettingsStore } from "../../store/codeSearchSettingsStore.js";
+import { createEmbeddingClient, type EmbeddingClient } from "../../integrations/llm/embeddingClient.js";
+import type { LlmConfigStore } from "../../store/llmConfigStore.js";
+import type { LocalGitClient } from "../../integrations/localGit/localGitClient.js";
 
 /** Whole indexing budget for one reindex — matches `listProjectFiles`'s own per-call cap, kept
  *  generous since only TS/JS files actually get chunked (everything else is read then discarded). */

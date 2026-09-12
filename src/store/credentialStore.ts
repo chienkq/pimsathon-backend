@@ -1,7 +1,7 @@
 import type { IntegrationProviderId } from "@chienkq/workflow-core";
 import { credentials, type WorkflowDb } from "@chienkq/workflow-db";
 import { eq } from "drizzle-orm";
-import { decryptSecret, encryptSecret } from "./credentialCrypto.js";
+import { decryptSecret, encryptSecret } from "../lib/credentialCrypto.js";
 
 /**
  * CRUD over the `credentials` table for the Integrations screen (W6) — one row per provider

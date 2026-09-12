@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import { llmConfigs, type WorkflowDb } from "@chienkq/workflow-db";
 import type { LlmConfigKind, LlmConfigSummary, LlmProviderId } from "@chienkq/workflow-core";
 import { eq } from "drizzle-orm";
-import { decryptSecret, encryptSecret } from "./credentialCrypto.js";
+import { decryptSecret, encryptSecret } from "../lib/credentialCrypto.js";
 
 export interface LlmConfigInput {
   name: string;

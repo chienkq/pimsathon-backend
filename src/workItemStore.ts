@@ -24,16 +24,30 @@ function toDomain(row: WorkItemRow, projectCode: string): PlatformWorkItem {
     storyPoints: row.storyPoints ?? undefined,
     externalProvider: row.externalProvider ?? undefined,
     externalKey: row.externalKey ?? undefined,
+    jiraRaw: row.jiraRaw ?? undefined,
     aiNote: row.aiNote ?? undefined,
   };
 }
 
-const FILTER_COLUMNS = {
+const TEXT_FILTER_COLUMNS = {
+  id: workItems.id,
   projectId: workItems.projectId,
+  title: workItems.title,
+  description: workItems.description,
   status: workItems.status,
   priority: workItems.priority,
+  assigneeId: workItems.assigneeId,
+  startDate: workItems.startDate,
+  dueDate: workItems.dueDate,
+  cycleId: workItems.cycleId,
   externalProvider: workItems.externalProvider,
   externalKey: workItems.externalKey,
+  aiNote: workItems.aiNote,
+} as const;
+
+/** `storyPoints` is the one filterable column that isn't text — kept separate so `eq()` compares it against a number, not a string. */
+const NUMBER_FILTER_COLUMNS = {
+  storyPoints: workItems.storyPoints,
 } as const;
 
 /**
@@ -54,7 +68,11 @@ export function createWorkItemStore(db: WorkflowDb): WorkItemStoreService {
     async list(filter: WorkItemListFilter) {
       const conditions = (Object.entries(filter) as [keyof WorkItemListFilter, string | undefined][])
         .filter(([, value]) => value !== undefined)
-        .map(([key, value]) => eq(FILTER_COLUMNS[key], value as string));
+        .map(([key, value]) =>
+          key in NUMBER_FILTER_COLUMNS
+            ? eq(NUMBER_FILTER_COLUMNS[key as keyof typeof NUMBER_FILTER_COLUMNS], Number(value))
+            : eq(TEXT_FILTER_COLUMNS[key as keyof typeof TEXT_FILTER_COLUMNS], value as string)
+        );
 
       const rows = await db
         .select({ item: workItems, projectCode: projects.code })

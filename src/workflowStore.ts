@@ -70,8 +70,6 @@ export function createWorkflowStore(db: WorkflowDb): WorkflowStore {
     },
 
     async remove(id: string) {
-      const [row] = await db.select().from(workflows).where(eq(workflows.id, id));
-      if (row?.isSystem) throw new Error(`Workflow ${id} is a system workflow and cannot be deleted`);
       await db.delete(workflows).where(eq(workflows.id, id));
     },
 

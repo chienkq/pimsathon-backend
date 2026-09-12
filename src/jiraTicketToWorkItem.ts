@@ -2,6 +2,81 @@ import type { NormalizedTicket, StoredTicket } from "@chienkq/workflow-core";
 import { planningGroups, projects, ticketSyncConflicts, workItems, type WorkflowDb } from "@chienkq/workflow-db";
 import { and, eq, inArray, sql } from "drizzle-orm";
 
+interface AdfNode {
+  type?: string;
+  text?: string;
+  content?: AdfNode[];
+}
+
+/** Block-level ADF node types that should end in a line break when flattened to plain text. */
+const ADF_BLOCK_TYPES = new Set(["paragraph", "heading", "listItem", "codeBlock", "blockquote"]);
+
+/** Flattens a Jira Cloud REST v3 "description" field (Atlassian Document Format) to plain text. */
+function adfToPlainText(node: AdfNode | undefined): string {
+  if (!node) return "";
+  if (node.type === "text") return node.text ?? "";
+  const childText = (node.content ?? []).map(adfToPlainText).join("");
+  return ADF_BLOCK_TYPES.has(node.type ?? "") ? `${childText}\n` : childText;
+}
+
+function stripHtml(html: string): string {
+  return html
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/(p|div|li|h[1-6])>/gi, "\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'");
+}
+
+/**
+ * Jira's real description text for a ticket, from whichever source has it:
+ * - the live Jira Sync path's `ticket.raw.fields.description` (ADF, since the `jira` node now requests
+ *   `fields: ["*all"]`) or its `renderedFields.description` (HTML) fallback;
+ * - the Excel/CSV import path's `ticket.raw["Description"]` column (Jira's own export already puts it
+ *   there as plain text — case-insensitive since Jira's column header casing varies by export/locale).
+ * Returns undefined (not "") when nothing is found, so callers can tell "no description" apart from "".
+ */
+function extractJiraDescription(ticket: NormalizedTicket): string | undefined {
+  const raw = ticket.raw;
+  const fields = raw.fields as Record<string, unknown> | undefined;
+  if (fields?.description && typeof fields.description === "object") {
+    const text = adfToPlainText(fields.description as AdfNode).trim();
+    if (text) return text;
+  }
+
+  const renderedFields = raw.renderedFields as Record<string, unknown> | undefined;
+  if (typeof renderedFields?.description === "string") {
+    const text = stripHtml(renderedFields.description).trim();
+    if (text) return text;
+  }
+
+  const descriptionKey = Object.keys(raw).find((k) => k.trim().toLowerCase() === "description");
+  if (descriptionKey) {
+    const text = String(raw[descriptionKey] ?? "").trim();
+    if (text) return text;
+  }
+
+  return undefined;
+}
+
+/**
+ * The work item description written on conversion: Jira's real description text (when found — see
+ * `extractJiraDescription`) followed by a short "imported from" note, or just the note when no
+ * description is available. Shared by `previewTicketConversions` and `convertTicketsToWorkItems` so a
+ * preview always matches exactly what gets written.
+ */
+function buildWorkItemDescription(ticket: NormalizedTicket): string {
+  const importNote = ticket.assignee
+    ? `Imported from Jira (${ticket.externalKey}). Assignee: ${ticket.assignee}.`
+    : `Imported from Jira (${ticket.externalKey}).`;
+  const jiraDescription = extractJiraDescription(ticket);
+  return jiraDescription ? `${jiraDescription}\n\n---\n${importNote}` : importNote;
+}
+
 const STATUS_ALIASES: Record<string, "Todo" | "In Progress" | "In Review" | "Done" | "Cancelled"> = {
   "to do": "Todo",
   "open": "Todo",
@@ -284,9 +359,7 @@ export async function previewTicketConversions(db: WorkflowDb, ticketsToPreview:
       .where(and(eq(workItems.externalProvider, ticket.provider), eq(workItems.externalKey, ticket.externalKey)));
 
     const changes: TicketConversionChange[] = [];
-    const description = ticket.assignee
-      ? `Imported from Jira (${ticket.externalKey}). Assignee: ${ticket.assignee}.`
-      : `Imported from Jira (${ticket.externalKey}).`;
+    const description = buildWorkItemDescription(ticket);
 
     let conflicts: TicketFieldConflict[] = [];
 
@@ -407,9 +480,7 @@ export async function convertTicketsToWorkItems(
       .from(workItems)
       .where(and(eq(workItems.externalProvider, ticket.provider), eq(workItems.externalKey, ticket.externalKey)));
 
-    const description = ticket.assignee
-      ? `Imported from Jira (${ticket.externalKey}). Assignee: ${ticket.assignee}.`
-      : `Imported from Jira (${ticket.externalKey}).`;
+    const description = buildWorkItemDescription(ticket);
 
     if (existing) {
       const remote: TicketMergeSnapshot = {
@@ -448,6 +519,7 @@ export async function convertTicketsToWorkItems(
           ...merge.patch,
           description,
           externalSyncBase: merge.newBase,
+          jiraRaw: ticket.raw,
           ...movePatch,
           ...(cycleId ? { cycleId } : {}),
           ...(moduleIds.length > 0 ? { moduleIds } : {}),
@@ -501,6 +573,7 @@ export async function convertTicketsToWorkItems(
       description,
       ...firstSyncBase,
       externalSyncBase: firstSyncBase,
+      jiraRaw: ticket.raw,
       cycleId: cycleId ?? "",
       moduleIds,
       labels: ticketLabels(ticket),

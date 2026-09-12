@@ -4,11 +4,13 @@ import {
   type AlertStoreService,
   type AnalysisResultStoreService,
   type TicketStoreService,
+  type CodeIndexService,
   type GitCacheStoreService,
   type GitClientService,
   type LocalGitClientService,
   type JiraClientService,
   type PlanningGroupStoreService,
+  type SendMessageToAgentService,
   type WebhookRequestPayload,
   type WidgetStoreService,
   type WorkflowDefinition,
@@ -40,6 +42,8 @@ export interface RunnerServices {
   gitCacheStore: GitCacheStoreService;
   analysisResultStore: AnalysisResultStoreService;
   llmClient: AiAgentLlmService;
+  agentClient: SendMessageToAgentService;
+  codeIndex: CodeIndexService;
   /** Only set for a run triggered by a real inbound webhook call — see `/api/webhooks/:workflowId` in index.ts. */
   webhookRequest?: WebhookRequestPayload;
 }
@@ -61,6 +65,87 @@ export async function ensureWorkflowRow(db: WorkflowDb, workflow: WorkflowDefini
       isSystem,
     })
     .onConflictDoNothing({ target: workflows.id });
+}
+
+/** In-flight manual runs' abort controllers, keyed by run id — populated by `startWorkflowRun`,
+ *  removed once the run settles. Only manual runs (the editor's Run button) are cancellable today;
+ *  scheduled/webhook runs still go through the synchronous `runWorkflow` below. */
+const activeRuns = new Map<string, AbortController>();
+
+/** Requests cancellation of a still-running manual run. Cooperative — the node currently executing
+ *  finishes, then the loop stops before the next one (see workflow-core's `executeWorkflow`).
+ *  Returns false if `runId` isn't a currently-tracked in-flight run (already finished, or unknown). */
+export function cancelWorkflowRun(runId: string): boolean {
+  const controller = activeRuns.get(runId);
+  if (!controller) return false;
+  controller.abort();
+  return true;
+}
+
+/**
+ * Starts a manual workflow run without waiting for it to finish: inserts the `workflow_runs` row and
+ * returns its id immediately, then executes in the background, updating that row (a partial
+ * `output` after every node, so a client polling `/runs/:runId` can render nodes finishing one at a
+ * time) and finally its terminal status. This is what makes the run cancellable — the caller gets
+ * `runId` back right away and can `cancelWorkflowRun(runId)` at any point before it settles.
+ */
+export async function startWorkflowRun(
+  db: WorkflowDb,
+  workflow: WorkflowDefinition,
+  services: RunnerServices,
+  connectorProvider?: string,
+): Promise<{ runId: string }> {
+  const runId = crypto.randomUUID();
+  const controller = new AbortController();
+  activeRuns.set(runId, controller);
+  await db.insert(workflowRuns).values({ id: runId, workflowId: workflow.id, status: "running", trigger: "manual" });
+
+  const partialResults: Record<string, unknown> = {};
+  void (async () => {
+    try {
+      const result = await executeWorkflow(workflow, {
+        services: services as unknown as Record<string, unknown>,
+        signal: controller.signal,
+        onNodeFinish: async (nodeId, nodeResult) => {
+          partialResults[nodeId] = nodeResult;
+          await db.update(workflowRuns).set({ output: { ...partialResults } }).where(eq(workflowRuns.id, runId));
+        },
+      });
+      await db
+        .update(workflowRuns)
+        .set({ status: result.status, finishedAt: new Date(), output: result.nodeResults as unknown as Record<string, unknown> })
+        .where(eq(workflowRuns.id, runId));
+
+      if (connectorProvider) {
+        await db
+          .insert(connectorStatus)
+          .values({ provider: connectorProvider, lastSyncAt: new Date(), lastSuccess: result.status === "success" })
+          .onConflictDoUpdate({
+            target: connectorStatus.provider,
+            set: { lastSyncAt: new Date(), lastSuccess: result.status === "success", lastError: null },
+          });
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await db
+        .update(workflowRuns)
+        .set({ status: "error", finishedAt: new Date(), error: message })
+        .where(eq(workflowRuns.id, runId));
+      if (connectorProvider) {
+        await db
+          .insert(connectorStatus)
+          .values({ provider: connectorProvider, lastSyncAt: new Date(), lastSuccess: false, lastError: message })
+          .onConflictDoUpdate({
+            target: connectorStatus.provider,
+            set: { lastSyncAt: new Date(), lastSuccess: false, lastError: message },
+          });
+      }
+    } finally {
+      activeRuns.delete(runId);
+    }
+  })();
+
+  return { runId };
 }
 
 export async function runWorkflow(

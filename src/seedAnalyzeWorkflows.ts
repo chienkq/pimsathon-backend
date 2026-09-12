@@ -4,6 +4,7 @@ export const ANALYZE_CYCLE_WORKFLOW_ID = "w12-analyze-cycle";
 export const ANALYZE_MODULE_WORKFLOW_ID = "w13-analyze-module";
 export const ANALYZE_WORKITEM_HEALTH_WORKFLOW_ID = "w14-analyze-workitem-health";
 export const ANALYZE_WORKITEM_LOCAL_SOURCE_WORKFLOW_ID = "w15-analyze-workitem-local-source";
+export const ANALYZE_WORKITEM_AUTHENTICITY_WORKFLOW_ID = "w16-analyze-workitem-authenticity";
 
 /**
  * Rule-based health computation, shared shape between Analyze Cycle and Analyze Module (see
@@ -378,14 +379,22 @@ export function buildAnalyzeModuleWorkflow(): WorkflowDefinition {
 }
 
 /**
- * Correlates each work item against local git branch names (via the `git` node's new Local source —
+ * Correlates each work item against local git branch names (via the git node's new Local source —
  * see [[git_control_settings_and_local_source]]: no GitHub connection configured, only a read-only
- * local checkout). Distinguishes the two merged inputs by shape: a branch row only has `name`, a
- * work item row has `key` (same technique as COMPUTE_CYCLE_HEALTH/COMPUTE_MODULE_HEALTH above).
+ * local checkout). Distinguishes the two upstream inputs by source node name (via inputs, now
+ * available to every code node — see [[n8n_clone_gap_tracker]]) rather than guessing from item
+ * shape, falling back to the old shape-based split only if inputs isn't populated (e.g. a stray
+ * single-node test run with no upstream connections wired up).
  */
 const COMPUTE_WORKITEM_LOCAL_SOURCE_STATUS = `
-const branches = items.filter((item) => item.json.key === undefined && item.json.name !== undefined);
-const workItemsList = items.filter((item) => item.json.key !== undefined);
+const byShape = (list) => ({
+  branches: list.filter((item) => item.json.key === undefined && item.json.name !== undefined),
+  workItemsList: list.filter((item) => item.json.key !== undefined),
+});
+const branchGroup = inputs.find((g) => g.sourceNodeName === "Git — Local Branches");
+const workItemGroup = inputs.find((g) => g.sourceNodeName === "Work Item");
+const branches = branchGroup ? branchGroup.items : byShape(items).branches;
+const workItemsList = workItemGroup ? workItemGroup.items : byShape(items).workItemsList;
 const ACTIVE_STATUSES = ["In Progress", "In Review"];
 
 return workItemsList
@@ -453,8 +462,8 @@ return items.map((item) => ({
  * local git activity instead of due dates/priority: does a local branch matching the item's key
  * exist, and does that agree with the tracked status? Built for the "no GitHub connection, local
  * checkout only" case (see [[git_control_settings_and_local_source]]) via the local-only \`git\`
- * node (separate from the \`github\` node). workItem(List) + git(List Branches) -> code (correlate) ->
- * sendMessageToAiAgent (narrative, real LLM call) -> code (assemble) ->
+ * node (separate from the \`github\` node). workItem(List) + git(List Branches) -> merge ->
+ * code (correlate) -> sendMessageToAiAgent (narrative, real LLM call) -> code (assemble) ->
  * analysisResultSave(subjectType: "workItem") -> if(needsAlert) -> raiseAlert. Deliberately a
  * separate workflow from Analyze Work Item Health (different input signal) rather than merged into
  * it — both write to the same analysisResultStore subject (subjectType "workItem", subjectId = the
@@ -477,24 +486,25 @@ export function buildAnalyzeWorkItemLocalSourceWorkflow(): WorkflowDefinition {
         position: { x: 0, y: 60 },
         parameters: { action: "List Branches" },
       },
-      { id: "correlate", type: "code", name: "Correlate With Local Branches", position: { x: 260, y: 0 }, parameters: { code: COMPUTE_WORKITEM_LOCAL_SOURCE_STATUS } },
-      { id: "aiPrompt", type: "code", name: "Build AI Prompt", position: { x: 520, y: 0 }, parameters: { code: AI_PROMPT_WORKITEM_LOCAL_SOURCE } },
+      { id: "merge", type: "merge", name: "Merge", position: { x: 260, y: 0 }, parameters: {} },
+      { id: "correlate", type: "code", name: "Correlate With Local Branches", position: { x: 520, y: 0 }, parameters: { code: COMPUTE_WORKITEM_LOCAL_SOURCE_STATUS } },
+      { id: "aiPrompt", type: "code", name: "Build AI Prompt", position: { x: 780, y: 0 }, parameters: { code: AI_PROMPT_WORKITEM_LOCAL_SOURCE } },
       {
         id: "aiAgent",
         type: "sendMessageToAiAgent",
         name: "Send Message to AI Agent",
-        position: { x: 780, y: 0 },
+        position: { x: 1040, y: 0 },
         // See the equivalent node in buildAnalyzeCycleWorkflow for why `message` is a fixed string.
         parameters: { agentName: "workitem-local-source-analyst", message: "Assess each work item's status against its local git branch activity and suggest actions." },
       },
-      { id: "assembleResult", type: "code", name: "Assemble Analysis Result", position: { x: 1040, y: 0 }, parameters: { code: ASSEMBLE_WORKITEM_LOCAL_SOURCE_RESULT } },
-      { id: "saveResult", type: "analysisResultSave", name: "Analysis Result — Save", position: { x: 1300, y: 0 }, parameters: { subjectType: "workItem" } },
-      { id: "needsAlert", type: "if", name: "If: Needs Alert", position: { x: 1560, y: 0 }, parameters: NEEDS_ALERT_IF_PARAMETERS },
+      { id: "assembleResult", type: "code", name: "Assemble Analysis Result", position: { x: 1300, y: 0 }, parameters: { code: ASSEMBLE_WORKITEM_LOCAL_SOURCE_RESULT } },
+      { id: "saveResult", type: "analysisResultSave", name: "Analysis Result — Save", position: { x: 1560, y: 0 }, parameters: { subjectType: "workItem" } },
+      { id: "needsAlert", type: "if", name: "If: Needs Alert", position: { x: 1820, y: 0 }, parameters: NEEDS_ALERT_IF_PARAMETERS },
       {
         id: "raiseAlert",
         type: "raiseAlert",
         name: "Raise Alert",
-        position: { x: 1820, y: 0 },
+        position: { x: 2080, y: 0 },
         parameters: {
           alertType: "workitem-local-source-mismatch",
           titleTemplate: "Status/code mismatch: {{key}} ({{status}})",
@@ -505,13 +515,78 @@ export function buildAnalyzeWorkItemLocalSourceWorkflow(): WorkflowDefinition {
       },
     ],
     connections: [
-      { id: "workItem-to-correlate", source: "workItem", target: "correlate" },
-      { id: "branches-to-correlate", source: "localBranches", target: "correlate" },
+      { id: "workItem-to-merge", source: "workItem", target: "merge" },
+      { id: "branches-to-merge", source: "localBranches", target: "merge" },
+      { id: "merge-to-correlate", source: "merge", target: "correlate" },
       { id: "correlate-to-prompt", source: "correlate", target: "aiPrompt" },
       { id: "prompt-to-agent", source: "aiPrompt", target: "aiAgent" },
       { id: "agent-to-assemble", source: "aiAgent", target: "assembleResult" },
       { id: "assemble-to-save", source: "assembleResult", target: "saveResult" },
       { id: "assemble-to-if", source: "assembleResult", target: "needsAlert" },
+      { id: "if-to-alert", source: "needsAlert", target: "raiseAlert", sourceOutput: "true" },
+    ],
+  };
+}
+
+/**
+ * "Analyze Work Item Authenticity" — verifies each work item against the CURRENT local source tree
+ * (no git history/diff, no embedding API — see the conversation this workflow was built from), via
+ * the `analyzeWorkItemAuthenticity` node's per-item search_code/read_file agent loop. Its verdict
+ * (done/partial/not_found) both saves to `analysisResultSave` (subjectType "workItem", same shared
+ * subject as w14/w15 so the Health Status panel's timeline shows all three lenses) and writes the
+ * agent's relevant-files findings straight into `workItem.aiNote` (via the new "Update AI Note
+ * (Bulk)" action) — so the NEXT run of this workflow reuses those files instead of re-searching from
+ * scratch (see the node's `reuseCachedFiles` parameter).
+ */
+export function buildAnalyzeWorkItemAuthenticityWorkflow(agentId: string): WorkflowDefinition {
+  const now = new Date().toISOString();
+  return {
+    id: ANALYZE_WORKITEM_AUTHENTICITY_WORKFLOW_ID,
+    name: "Analyze Work Item Authenticity",
+    active: true,
+    createdAt: now,
+    updatedAt: now,
+    nodes: [
+      { id: "workItem", type: "workItem", name: "Work Item", position: { x: 0, y: 0 }, parameters: { action: "List" } },
+      {
+        id: "authenticityAgent",
+        type: "analyzeWorkItemAuthenticity",
+        name: "Analyze Work Item Authenticity",
+        position: { x: 260, y: 0 },
+        parameters: { agentId, reuseCachedFiles: true },
+      },
+      { id: "saveResult", type: "analysisResultSave", name: "Analysis Result — Save", position: { x: 560, y: -80 }, parameters: { subjectType: "workItem" } },
+      {
+        id: "updateAiNote",
+        type: "workItem",
+        name: "Work Item — Update AI Note",
+        position: { x: 560, y: 80 },
+        parameters: { action: "Update AI Note (Bulk)", idField: "id", aiNoteField: "aiNoteText" },
+      },
+      { id: "needsAlert", type: "if", name: "If: Needs Alert", position: { x: 820, y: -80 }, parameters: NEEDS_ALERT_IF_PARAMETERS },
+      {
+        id: "raiseAlert",
+        type: "raiseAlert",
+        name: "Raise Alert",
+        position: { x: 1080, y: -80 },
+        parameters: {
+          alertType: "workitem-authenticity-mismatch",
+          titleTemplate: "Authenticity check: {{verdict}} for {{key}} ({{itemStatus}})",
+          messageTemplate: "{{reasoning}}\n\nRelevant files: {{relevantFiles}}",
+          dedupeKeyField: "subjectId",
+          workItemIdField: "subjectId",
+          defaultSeverity: "medium",
+        },
+      },
+    ],
+    connections: [
+      { id: "workItem-to-agent", source: "workItem", target: "authenticityAgent" },
+      { id: "agent-to-save", source: "authenticityAgent", target: "saveResult" },
+      { id: "agent-to-note", source: "authenticityAgent", target: "updateAiNote" },
+      // `if`/`raiseAlert` fan out from the agent node directly (like Analyze Cycle/Module/w14/w15's
+      // code node), not from `saveResult` — `analysisResultSave`'s output is narrowed to the stored
+      // AnalysisResult shape and has no `verdict`/`key`/`itemStatus`/`reasoning`/`relevantFiles`.
+      { id: "agent-to-if", source: "authenticityAgent", target: "needsAlert" },
       { id: "if-to-alert", source: "needsAlert", target: "raiseAlert", sourceOutput: "true" },
     ],
   };

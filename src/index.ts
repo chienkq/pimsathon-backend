@@ -9,7 +9,9 @@ import {
   WORK_ITEM_STATUSES,
   type GitControlDefaultSource,
   type IntegrationProviderId,
+  type LlmConfigKind,
   type LlmProviderId,
+  type NodeExecuteInputGroup,
   type NodeExecutionData,
   type WorkflowDefinition,
   type WorkflowNodeDefinition,
@@ -33,6 +35,9 @@ import { and, desc, eq, inArray } from "drizzle-orm";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import multipart from "@fastify/multipart";
+import { createAgentToolStore, type AgentToolInput } from "./agentToolStore.js";
+import { runAgentTool } from "./agentToolRunner.js";
+import { createAiAgentStore, type AiAgentInput } from "./aiAgentStore.js";
 import { createAlertStore } from "./alertStore.js";
 import { createAnalysisResultStore } from "./analysisResultStore.js";
 import {
@@ -44,6 +49,9 @@ import {
   type AdminUiWorkItemFields,
 } from "./adminUiSync.js";
 import { createAppSettingsStore } from "./appSettingsStore.js";
+import { createCodeIndexStore } from "./codeIndexStore.js";
+import { createCodeIndexService } from "./codeIndexService.js";
+import { createCodeSearchSettingsStore, type CodeSearchSettings } from "./codeSearchSettingsStore.js";
 import { createCredentialStore } from "./credentialStore.js";
 import { env } from "./env.js";
 import { createTicketStore } from "./ticketStore.js";
@@ -58,9 +66,10 @@ import { createLocalGitClientFromCredentials, testLocalGitConnection } from "./l
 import { parseJiraExcelImport } from "./jiraExcelImport.js";
 import { convertNamesToPlanningGroups, convertTicketsToWorkItems, previewTicketConversions } from "./jiraTicketToWorkItem.js";
 import { createJiraImportJobStore } from "./jiraImportJobs.js";
-import { createLlmClient } from "./llmClient.js";
+import { createChunkedUploadStore } from "./chunkedUploads.js";
+import { createAgentClient, createLlmClient } from "./llmClient.js";
 import { createOutlookClient } from "./outlookClient.js";
-import { ensureWorkflowRow, resolveWorkflow, runWorkflow, type RunnerServices } from "./runner.js";
+import { cancelWorkflowRun, ensureWorkflowRow, resolveWorkflow, runWorkflow, startWorkflowRun, type RunnerServices } from "./runner.js";
 import { scheduleWorkflow } from "./scheduler.js";
 import { createSlackClient } from "./slackClient.js";
 import { createTeamsClient } from "./teamsClient.js";
@@ -85,11 +94,14 @@ import {
   ANALYZE_MODULE_WORKFLOW_ID,
   ANALYZE_WORKITEM_HEALTH_WORKFLOW_ID,
   ANALYZE_WORKITEM_LOCAL_SOURCE_WORKFLOW_ID,
+  ANALYZE_WORKITEM_AUTHENTICITY_WORKFLOW_ID,
   buildAnalyzeCycleWorkflow,
   buildAnalyzeModuleWorkflow,
   buildAnalyzeWorkItemHealthWorkflow,
   buildAnalyzeWorkItemLocalSourceWorkflow,
+  buildAnalyzeWorkItemAuthenticityWorkflow,
 } from "./seedAnalyzeWorkflows.js";
+import { seedAuthenticityAgent } from "./seedAuthenticityAgent.js";
 import { createPlanningGroupStore } from "./planningGroupStore.js";
 import { getProjectHealth } from "./projectHealth.js";
 import { createWidgetStore } from "./widgetStore.js";
@@ -99,13 +111,19 @@ const db = createDb(env.databaseUrl);
 const workflowStore = createWorkflowStore(db);
 const credentialStore = createCredentialStore(db);
 const llmConfigStore = createLlmConfigStore(db);
+const aiAgentStore = createAiAgentStore(db);
+const agentToolStore = createAgentToolStore(db);
 const appSettingsStore = createAppSettingsStore(db);
 const jiraImportJobs = createJiraImportJobStore();
+const chunkedUploads = createChunkedUploadStore();
 const ticketSyncConflictStore = createTicketSyncConflictStore(db);
 // Full-typed (getFileSnippet + listBranches/getStatus/getLog/getConfigList) — also used directly by
 // the `/api/local-git/*` routes below, not just as the narrower `LocalGitClientService` the `git`
 // node asks for.
 const localGitClient = createLocalGitClientFromCredentials(credentialStore);
+const codeSearchSettingsStore = createCodeSearchSettingsStore(appSettingsStore);
+const codeIndexStore = createCodeIndexStore(db);
+const codeIndexService = createCodeIndexService({ localGitClient, codeSearchSettingsStore, codeIndexStore, llmConfigStore });
 const services: RunnerServices = {
   jiraClient: createJiraClientFromCredentials(credentialStore),
   ticketStore: createTicketStore(db),
@@ -118,9 +136,12 @@ const services: RunnerServices = {
   gitCacheStore: createGitCacheStore(db),
   analysisResultStore: createAnalysisResultStore(db),
   llmClient: createLlmClient(llmConfigStore),
+  agentClient: createAgentClient(aiAgentStore, agentToolStore, llmConfigStore),
+  codeIndex: codeIndexService,
 };
 
 await seedPlatformData(db);
+const authenticityAgentId = await seedAuthenticityAgent(aiAgentStore, agentToolStore);
 
 /** Registered workflows, keyed by id — `connectorProvider` is set only for connector-sync workflows (W1, W3), not rule/metric workflows (W8-W10, W11). */
 const registeredWorkflows = {
@@ -168,6 +189,11 @@ const registeredWorkflows = {
     cron: "0 */2 * * *",
     connectorProvider: undefined,
   },
+  [ANALYZE_WORKITEM_AUTHENTICITY_WORKFLOW_ID]: {
+    workflow: buildAnalyzeWorkItemAuthenticityWorkflow(authenticityAgentId),
+    cron: "0 */2 * * *",
+    connectorProvider: undefined,
+  },
 } as const;
 
 for (const { workflow, cron, connectorProvider } of Object.values(registeredWorkflows)) {
@@ -175,7 +201,10 @@ for (const { workflow, cron, connectorProvider } of Object.values(registeredWork
   scheduleWorkflow(db, workflow, cron, services, connectorProvider);
 }
 
-const app = Fastify({ logger: true });
+// Default (1MB) is too small for some real workflow payloads — e.g. the ad-hoc workflow body on
+// `/run`, or a git node's "Read Project Files" output flowing through `/node-types/:type/execute`'s
+// `input` — which were failing with "Payload Too Large" (413) before this.
+const app = Fastify({ logger: true, bodyLimit: 50 * 1024 * 1024 });
 
 // Dev-only permissive CORS — admin-ui (Vite, a different origin/port) calls this API directly from
 // the browser. Tighten to an explicit allowlist before this backend is ever exposed beyond localhost.
@@ -257,12 +286,41 @@ app.patch("/api/workflows/:id/active", async (request, reply) => {
   }
 });
 
+// Start/append for a chunked upload (see chunkedUploads.ts) — lets a client with a large payload
+// (an ad-hoc workflow definition, or a git node's "Read Project Files" output) send it as many small
+// requests instead of hitting the body-size limit on the endpoint that actually consumes it.
+// `/api/workflows/:id/run` and `/api/node-types/:type/execute` accept `{ uploadId }` in place of
+// their normal inline body.
+app.post("/api/uploads", async () => ({ uploadId: chunkedUploads.start() }));
+
+app.post("/api/uploads/:id/chunks", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const { index, data } = (request.body as { index?: number; data?: string } | undefined) ?? {};
+  if (typeof index !== "number" || typeof data !== "string") {
+    return reply.code(400).send({ error: "chunk body must be { index: number, data: string }" });
+  }
+  try {
+    chunkedUploads.appendChunk(id, index, data);
+    return { ok: true };
+  } catch (error) {
+    return reply.code(404).send({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
 app.post("/api/workflows/:id/run", async (request, reply) => {
   const { id } = request.params as { id: string };
   const entry = (registeredWorkflows as Record<string, (typeof registeredWorkflows)[keyof typeof registeredWorkflows]>)[
     id
   ];
-  const { workflow: adHocWorkflow } = (request.body as { workflow?: WorkflowDefinition } | undefined) ?? {};
+  const body = (request.body as { workflow?: WorkflowDefinition; uploadId?: string } | undefined) ?? {};
+  let adHocWorkflow: WorkflowDefinition | undefined;
+  try {
+    adHocWorkflow = body.uploadId
+      ? chunkedUploads.finish<{ workflow?: WorkflowDefinition }>(body.uploadId).workflow
+      : body.workflow;
+  } catch (error) {
+    return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+  }
 
   // Ad-hoc run (the editor's "Run" button, possibly with unsaved edits) takes precedence over both
   // the fixed registered set and whatever's currently saved for this id; falls back to a saved
@@ -272,19 +330,19 @@ app.post("/api/workflows/:id/run", async (request, reply) => {
 
   try {
     if (adHocWorkflow) await ensureWorkflowRow(db, adHocWorkflow);
-    const result = await runWorkflow(db, workflow, services, "manual", entry?.connectorProvider);
-    if (result.status === "error") {
-      return reply.code(502).send({
-        status: result.status,
-        nodeResults: result.nodeResults,
-        runId: result.runId,
-        error: "Workflow run finished with a node error — see nodeResults for details.",
-      });
-    }
-    return { status: result.status, nodeResults: result.nodeResults, runId: result.runId };
+    const { runId } = await startWorkflowRun(db, workflow, services, entry?.connectorProvider);
+    return reply.code(202).send({ status: "running", runId });
   } catch (error) {
     return reply.code(500).send({ status: "error", error: error instanceof Error ? error.message : String(error) });
   }
+});
+
+// Stop button — cooperatively cancels a still-running manual run (see `cancelWorkflowRun`). Returns
+// 404 once the run has already settled (or for an unknown id), since there's nothing left to cancel.
+app.post("/api/workflows/:id/runs/:runId/cancel", async (request, reply) => {
+  const { runId } = request.params as { id: string; runId: string };
+  if (!cancelWorkflowRun(runId)) return reply.code(404).send({ error: `No in-flight run: ${runId}` });
+  return { ok: true };
 });
 
 // The NDV "Execute" button — runs one node type in isolation against the real backend services
@@ -292,9 +350,51 @@ app.post("/api/workflows/:id/run", async (request, reply) => {
 // editor already resolved client-side from the upstream node's last result.
 app.post("/api/node-types/:type/execute", async (request, reply) => {
   const { type } = request.params as { type: string };
-  const { parameters, input } = (request.body as { parameters?: Record<string, unknown>; input?: NodeExecutionData[] } | undefined) ?? {};
+  const body =
+    (request.body as
+      | {
+          parameters?: Record<string, unknown>;
+          input?: NodeExecutionData[];
+          inputs?: NodeExecuteInputGroup[];
+          nodeContext?: Record<string, Record<string, unknown>>;
+          uploadId?: string;
+        }
+      | undefined) ?? {};
+  let parameters: Record<string, unknown> | undefined;
+  let input: NodeExecutionData[] | undefined;
+  let inputs: NodeExecuteInputGroup[] | undefined;
+  let nodeContext: Record<string, Record<string, unknown>> | undefined;
   try {
-    const result = await executeSingleNode(type, parameters ?? {}, input ?? [], services as unknown as Record<string, unknown>);
+    if (body.uploadId) {
+      const resolved = chunkedUploads.finish<{
+        parameters?: Record<string, unknown>;
+        input?: NodeExecutionData[];
+        inputs?: NodeExecuteInputGroup[];
+        nodeContext?: Record<string, Record<string, unknown>>;
+      }>(body.uploadId);
+      parameters = resolved.parameters;
+      input = resolved.input;
+      inputs = resolved.inputs;
+      nodeContext = resolved.nodeContext;
+    } else {
+      parameters = body.parameters;
+      input = body.input;
+      inputs = body.inputs;
+      nodeContext = body.nodeContext;
+    }
+  } catch (error) {
+    return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+  }
+
+  try {
+    const result = await executeSingleNode(
+      type,
+      parameters ?? {},
+      input ?? [],
+      services as unknown as Record<string, unknown>,
+      inputs,
+      nodeContext
+    );
     if (result.status === "error") return reply.code(502).send(result);
     return result;
   } catch (error) {
@@ -495,6 +595,16 @@ app.delete("/api/members/:id", async (request, reply) => {
 });
 
 app.get("/api/work-items", async () => ({ workItems: await services.workItemStore.list({}) }));
+
+// One work item's full record, `jiraRaw`/`aiNote` included — used by the `recall_workitem` agent
+// tool (see `seedAuthenticityAgent.ts`) so an AI Agent can fetch a work item's raw Jira payload
+// itself instead of only seeing whatever subset a workflow node's context already handed it.
+app.get("/api/work-items/:id", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const item = await services.workItemStore.get(id);
+  if (!item) return reply.code(404).send({ error: `Unknown work item: ${id}` });
+  return { workItem: item };
+});
 
 // Latest result from the "Analyze Work Item Health" workflow for one work item — null until that
 // workflow has run at least once for this item (see analysisResultStore.ts / seedAnalyzeWorkflows.ts).
@@ -937,10 +1047,15 @@ app.get("/api/llm-providers", async () => ({
     connectionFields: p.connectionFields,
     defaultModel: p.defaultModel,
     modelPlaceholder: p.modelPlaceholder,
+    supportsEmbedding: p.supportsEmbedding,
   })),
 }));
 
-app.get("/api/llm-configs", async () => ({ configs: await llmConfigStore.list() }));
+app.get("/api/llm-configs", async (request) => {
+  const { kind } = (request.query as { kind?: string }) ?? {};
+  if (kind && kind !== "chat" && kind !== "embedding") throw new Error(`\`kind\` must be "chat" or "embedding"`);
+  return { configs: await llmConfigStore.list(kind as LlmConfigKind | undefined) };
+});
 
 /**
  * `keepExistingApiKey` is true when updating a config that already has a stored key and the request
@@ -948,9 +1063,11 @@ app.get("/api/llm-configs", async () => ({ configs: await llmConfigStore.list() 
  * required-field check is skipped for just that case.
  */
 function parseLlmConfigInput(body: unknown, keepExistingApiKey = false): LlmConfigInput {
-  const input = (body ?? {}) as Partial<LlmConfigInput> & { provider?: string };
+  const input = (body ?? {}) as Partial<LlmConfigInput> & { provider?: string; kind?: string };
+  const kind: LlmConfigKind = input.kind === "embedding" ? "embedding" : "chat";
   const spec = getLlmProvider(input.provider ?? "");
   if (!spec) throw new Error(`Unknown LLM provider: ${input.provider}`);
+  if (kind === "embedding" && spec.supportsEmbedding !== true) throw new Error(`${spec.displayName} has no embeddings API.`);
   if (!input.name?.trim()) throw new Error("Name is required.");
   if (!input.model?.trim()) throw new Error("Model is required.");
 
@@ -962,14 +1079,22 @@ function parseLlmConfigInput(body: unknown, keepExistingApiKey = false): LlmConf
     if (field.required && !value?.trim()) missing.push(field.label);
     if (value) extra[field.key] = value.trim();
   }
+  // Embedding-only extras: prefixes some instruction-tuned models expect (e.g. e5's "query: "/"passage: ").
+  if (kind === "embedding") {
+    const embeddingExtra = input.extra as Record<string, string> | undefined;
+    if (embeddingExtra?.queryPrefix) extra.queryPrefix = embeddingExtra.queryPrefix;
+    if (embeddingExtra?.passagePrefix) extra.passagePrefix = embeddingExtra.passagePrefix;
+  }
   const needsApiKey = spec.connectionFields.some((f) => f.key === "apiKey" && f.required);
   if (needsApiKey && !input.apiKey && !keepExistingApiKey) missing.push("API Key");
   const needsBaseUrl = spec.connectionFields.some((f) => f.key === "baseUrl" && f.required);
   if (needsBaseUrl && !input.baseUrl?.trim()) missing.push("Base URL");
+  if (kind === "embedding" && !input.dimension) missing.push("Output dimension");
   if (missing.length > 0) throw new Error(`Missing required field(s): ${missing.join(", ")}`);
 
   return {
     name: input.name.trim(),
+    kind,
     provider: spec.id as LlmProviderId,
     model: input.model.trim(),
     apiKey: input.apiKey,
@@ -980,6 +1105,7 @@ function parseLlmConfigInput(body: unknown, keepExistingApiKey = false): LlmConf
     topP: input.topP,
     timeoutMs: input.timeoutMs ?? 60000,
     systemPrompt: input.systemPrompt?.trim(),
+    dimension: kind === "embedding" ? Number(input.dimension) : undefined,
   };
 }
 
@@ -1059,6 +1185,129 @@ app.post("/api/llm-configs/:id/test", async (request, reply) => {
   }
 });
 
+// AI Agents (Automation sidebar) — a Markdown "system prompt" + an assigned LLM Config + assigned
+// Tools, referenced by the "Send Message to Agent" node via a live dropdown (unlike the older "Send
+// Message to AI Agent" node, which points straight at an `llm_configs` row by free-typed name).
+app.get("/api/ai-agents", async () => ({ agents: await aiAgentStore.list() }));
+
+app.get("/api/ai-agents/:id", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const agent = await aiAgentStore.get(id);
+  if (!agent) return reply.code(404).send({ error: `Unknown AI Agent: ${id}` });
+  return { agent };
+});
+
+function parseAiAgentInput(body: unknown): AiAgentInput {
+  const input = (body ?? {}) as Partial<AiAgentInput>;
+  if (!input.name?.trim()) throw new Error("Name is required.");
+  const maxToolIterations = Number(input.maxToolIterations);
+  return {
+    name: input.name.trim(),
+    markdown: input.markdown ?? "",
+    llmConfigId: input.llmConfigId || undefined,
+    toolIds: Array.isArray(input.toolIds) ? input.toolIds.filter((id): id is string => typeof id === "string") : [],
+    maxToolIterations: Number.isFinite(maxToolIterations) && maxToolIterations > 0 ? Math.floor(maxToolIterations) : 8,
+  };
+}
+
+app.post("/api/ai-agents", async (request, reply) => {
+  try {
+    const agent = await aiAgentStore.create(parseAiAgentInput(request.body));
+    return reply.code(201).send({ agent });
+  } catch (error) {
+    return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.put("/api/ai-agents/:id", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  if (!(await aiAgentStore.get(id))) return reply.code(404).send({ error: `Unknown AI Agent: ${id}` });
+  try {
+    const agent = await aiAgentStore.update(id, parseAiAgentInput(request.body));
+    return { agent };
+  } catch (error) {
+    return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.delete("/api/ai-agents/:id", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  if (!(await aiAgentStore.get(id))) return reply.code(404).send({ error: `Unknown AI Agent: ${id}` });
+  await aiAgentStore.remove(id);
+  return { status: "success" };
+});
+
+// Tools (Automation sidebar) — a named JS function ("agent_tools" row) an AI Agent may call
+// mid-conversation. `name` doubles as the callable name sent to the provider, so it's validated to
+// look like one.
+app.get("/api/agent-tools", async () => ({ tools: await agentToolStore.list() }));
+
+app.get("/api/agent-tools/:id", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const tool = await agentToolStore.get(id);
+  if (!tool) return reply.code(404).send({ error: `Unknown tool: ${id}` });
+  return { tool };
+});
+
+function parseAgentToolInput(body: unknown): AgentToolInput {
+  const input = (body ?? {}) as Partial<AgentToolInput>;
+  const name = input.name?.trim() ?? "";
+  if (!name) throw new Error("Name is required.");
+  if (!/^[a-zA-Z_][a-zA-Z0-9_-]*$/.test(name)) {
+    throw new Error(
+      "Name must look like a function name (letters, digits, _ or -, not starting with a digit) — it's sent to the model as the tool's callable name.",
+    );
+  }
+  return {
+    name,
+    description: input.description?.trim() ?? "",
+    parametersSchema: (input.parametersSchema as Record<string, unknown> | undefined) ?? { type: "object", properties: {} },
+    code: input.code ?? "",
+  };
+}
+
+app.post("/api/agent-tools", async (request, reply) => {
+  try {
+    const tool = await agentToolStore.create(parseAgentToolInput(request.body));
+    return reply.code(201).send({ tool });
+  } catch (error) {
+    return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.put("/api/agent-tools/:id", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  if (!(await agentToolStore.get(id))) return reply.code(404).send({ error: `Unknown tool: ${id}` });
+  try {
+    const tool = await agentToolStore.update(id, parseAgentToolInput(request.body));
+    return { tool };
+  } catch (error) {
+    return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.delete("/api/agent-tools/:id", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  if (!(await agentToolStore.get(id))) return reply.code(404).send({ error: `Unknown tool: ${id}` });
+  await agentToolStore.remove(id);
+  return { status: "success" };
+});
+
+// Quick "Run" button on the Tool editor — executes the tool's JS against sample params without an
+// actual agent conversation, so a tool author can smoke-test it in isolation.
+app.post("/api/agent-tools/:id/test", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const tool = await agentToolStore.get(id);
+  if (!tool) return reply.code(404).send({ error: `Unknown tool: ${id}` });
+  const { params } = (request.body as { params?: Record<string, unknown> } | undefined) ?? {};
+  try {
+    const result = await runAgentTool(tool.code, params ?? {});
+    return { status: "success", result };
+  } catch (error) {
+    return reply.code(400).send({ status: "error", error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
 // Reads a code snippet from the `local-git` integration's configured folder — used by the Work Item
 // AI Note "Insert code reference" action to test code-location memos without a real GitHub connection.
 app.get("/api/local-git/file", async (request, reply) => {
@@ -1074,6 +1323,24 @@ app.get("/api/local-git/file", async (request, reply) => {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return reply.code(400).send({ error: message });
+  }
+});
+
+// `git grep` over the `local-git` folder — exposed as an HTTP route (not just the in-process
+// `localGitClient` service) so an `agent_tools` row's sandboxed JS (no service injection, see
+// `agentToolRunner.ts`) can call it as a real function-calling tool, e.g. for the "Analyze Work Item
+// Authenticity" AI Agent's `search_code` tool.
+app.get("/api/local-git/search", async (request, reply) => {
+  const { pattern, maxResults, ignoreCase } = request.query as { pattern?: string; maxResults?: string; ignoreCase?: string };
+  if (!pattern) return reply.code(400).send({ error: "Query param `pattern` is required." });
+  try {
+    const matches = await localGitClient.searchCode(pattern, {
+      maxResults: maxResults ? Number(maxResults) : undefined,
+      ignoreCase: ignoreCase === undefined ? undefined : ignoreCase !== "false",
+    });
+    return { matches };
+  } catch (error) {
+    return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
   }
 });
 
@@ -1104,6 +1371,48 @@ app.put("/api/settings/git-control", async (request, reply) => {
     return reply.code(400).send({ error: `\`defaultSource\` must be one of: ${GIT_CONTROL_PROVIDER_IDS.join(", ")}` });
   await appSettingsStore.set(GIT_CONTROL_SETTINGS_ID, { defaultSource });
   return { status: "success", defaultSource };
+});
+
+// Code Search — which `llm_configs` row (kind: "embedding") to embed with, plus manual
+// reindex/search actions, surfaced from a Project Settings section. Indexing always reads from
+// the same `local-git` repo used elsewhere (see `localGitClient` above) — no separate repo picker.
+// The embedding model/credentials themselves live in LLM Settings (Automation sidebar), not here.
+app.get("/api/settings/code-search", async () => {
+  return codeSearchSettingsStore.get();
+});
+
+app.put("/api/settings/code-search", async (request, reply) => {
+  const { embeddingConfigId } = (request.body as Partial<CodeSearchSettings> | undefined) ?? {};
+  if (embeddingConfigId) {
+    const config = await llmConfigStore.get(embeddingConfigId);
+    if (!config) return reply.code(400).send({ error: `Unknown LLM config: ${embeddingConfigId}` });
+    if (config.kind !== "embedding") return reply.code(400).send({ error: `LLM Config "${config.name}" is not an embedding config.` });
+  }
+  const settings: CodeSearchSettings = { embeddingConfigId: embeddingConfigId ?? null };
+  await codeSearchSettingsStore.set(settings);
+  return { status: "success", ...settings };
+});
+
+app.get("/api/code-index/count", async () => {
+  return { count: await codeIndexStore.count() };
+});
+
+app.post("/api/code-index/reindex", async (_request, reply) => {
+  try {
+    return await codeIndexService.reindex();
+  } catch (error) {
+    return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.post("/api/code-index/search", async (request, reply) => {
+  const { query, topK } = (request.body as { query?: string; topK?: number } | undefined) ?? {};
+  if (!query?.trim()) return reply.code(400).send({ error: "`query` is required." });
+  try {
+    return { results: await codeIndexService.search(query.trim(), Math.min(Math.max(topK ?? 5, 1), 50)) };
+  } catch (error) {
+    return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) });
+  }
 });
 
 // Jira Excel import — an alternative to the live `/rest/api/3/search` sync (W1) for teams that export

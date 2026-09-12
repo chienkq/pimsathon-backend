@@ -52,6 +52,12 @@ export interface LocalGitProjectFiles {
   truncated: boolean;
 }
 
+export interface LocalGitSearchMatch {
+  path: string;
+  line: number;
+  text: string;
+}
+
 /** Extensions never worth reading as text — binary/generated, would just burn the size budget. */
 const SKIP_EXTENSIONS = new Set([
   ".png", ".jpg", ".jpeg", ".gif", ".ico", ".webp", ".bmp", ".svg",
@@ -255,6 +261,37 @@ export function createLocalGitClient(config: { repoPath: string }) {
 
       return { files, fileCount: files.length, totalBytes, truncated };
     },
+
+    /** `git grep -n -I` over tracked files (respects `.gitignore`) — `pattern` is a basic regex by
+     *  default (git grep's own syntax), not a fixed string. Used as the no-embedding-API fallback for
+     *  "does the codebase contain X" lookups (an AI agent's `search_code` tool): cheap, exact, but only
+     *  as good as the keyword/regex it's given, unlike semantic search. `git grep` exits 1 (not an
+     *  error) when nothing matches, so that case is caught and returned as an empty array. */
+    async searchCode(pattern: string, options?: { maxResults?: number; ignoreCase?: boolean }): Promise<LocalGitSearchMatch[]> {
+      const maxResults = Math.min(Math.max(options?.maxResults ?? 30, 1), 200);
+      const args = ["-C", config.repoPath, "grep", "-n", "-I"];
+      if (options?.ignoreCase !== false) args.push("-i");
+      args.push("-e", pattern, "--");
+      try {
+        const { stdout } = await execFileAsync("git", args, { maxBuffer: 10 * 1024 * 1024 });
+        return stdout
+          .split("\n")
+          .filter(Boolean)
+          .slice(0, maxResults)
+          .map((line) => {
+            const firstColon = line.indexOf(":");
+            const secondColon = line.indexOf(":", firstColon + 1);
+            return {
+              path: line.slice(0, firstColon),
+              line: Number(line.slice(firstColon + 1, secondColon)) || 0,
+              text: line.slice(secondColon + 1),
+            };
+          });
+      } catch (error) {
+        if ((error as { code?: number }).code === 1) return [];
+        throw error;
+      }
+    },
   };
 }
 
@@ -292,6 +329,9 @@ export function createLocalGitClientFromCredentials(credentialStore: CredentialS
     },
     async listProjectFiles(options?: { maxTotalBytes?: number }) {
       return (await requireClient()).listProjectFiles(options);
+    },
+    async searchCode(pattern: string, options?: { maxResults?: number; ignoreCase?: boolean }) {
+      return (await requireClient()).searchCode(pattern, options);
     },
   };
 }

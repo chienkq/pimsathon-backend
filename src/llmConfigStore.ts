@@ -1,11 +1,12 @@
 import crypto from "node:crypto";
 import { llmConfigs, type WorkflowDb } from "@chienkq/workflow-db";
-import type { LlmConfigSummary, LlmProviderId } from "@chienkq/workflow-core";
+import type { LlmConfigKind, LlmConfigSummary, LlmProviderId } from "@chienkq/workflow-core";
 import { eq } from "drizzle-orm";
 import { decryptSecret, encryptSecret } from "./credentialCrypto.js";
 
 export interface LlmConfigInput {
   name: string;
+  kind: LlmConfigKind;
   provider: LlmProviderId;
   model: string;
   /** Omitted = leave the stored key as-is (update only); empty string clears it. */
@@ -17,12 +18,15 @@ export interface LlmConfigInput {
   topP?: number;
   timeoutMs: number;
   systemPrompt?: string;
+  /** Required for `kind: "embedding"`, ignored for `kind: "chat"`. */
+  dimension?: number;
 }
 
 function toSummary(row: typeof llmConfigs.$inferSelect): LlmConfigSummary {
   return {
     id: row.id,
     name: row.name,
+    kind: row.kind as LlmConfigKind,
     provider: row.provider as LlmProviderId,
     model: row.model,
     baseUrl: row.baseUrl,
@@ -32,6 +36,7 @@ function toSummary(row: typeof llmConfigs.$inferSelect): LlmConfigSummary {
     topP: row.topP,
     timeoutMs: row.timeoutMs,
     systemPrompt: row.systemPrompt,
+    dimension: row.dimension,
     isDefault: row.isDefault,
     hasApiKey: Boolean(row.apiKeyEncrypted),
     createdAt: row.createdAt.toISOString(),
@@ -52,8 +57,12 @@ export function createLlmConfigStore(db: WorkflowDb) {
   }
 
   return {
-    async list(): Promise<LlmConfigSummary[]> {
-      const rows = await db.select().from(llmConfigs).orderBy(llmConfigs.createdAt);
+    /** `kind` optionally narrows to just "chat" or "embedding" rows — used by Code Search's config
+     *  picker, which should only ever list embedding configs. */
+    async list(kind?: LlmConfigKind): Promise<LlmConfigSummary[]> {
+      const rows = kind
+        ? await db.select().from(llmConfigs).where(eq(llmConfigs.kind, kind)).orderBy(llmConfigs.createdAt)
+        : await db.select().from(llmConfigs).orderBy(llmConfigs.createdAt);
       return rows.map(toSummary);
     },
 
@@ -68,11 +77,12 @@ export function createLlmConfigStore(db: WorkflowDb) {
 
     async create(input: LlmConfigInput): Promise<LlmConfigSummary> {
       const id = crypto.randomUUID();
-      const existing = await db.select({ id: llmConfigs.id }).from(llmConfigs).limit(1);
-      const isFirst = existing.length === 0;
+      const existing = await db.select({ id: llmConfigs.id }).from(llmConfigs).where(eq(llmConfigs.kind, input.kind)).limit(1);
+      const isFirstOfKind = existing.length === 0;
       await db.insert(llmConfigs).values({
         id,
         name: input.name,
+        kind: input.kind,
         provider: input.provider,
         model: input.model,
         apiKeyEncrypted: input.apiKey ? encryptSecret(input.apiKey) : null,
@@ -83,7 +93,8 @@ export function createLlmConfigStore(db: WorkflowDb) {
         topP: input.topP ?? null,
         timeoutMs: input.timeoutMs,
         systemPrompt: input.systemPrompt || null,
-        isDefault: isFirst,
+        dimension: input.kind === "embedding" ? (input.dimension ?? null) : null,
+        isDefault: isFirstOfKind,
       });
       return (await get(id))!;
     },
@@ -91,6 +102,7 @@ export function createLlmConfigStore(db: WorkflowDb) {
     async update(id: string, input: LlmConfigInput): Promise<LlmConfigSummary | undefined> {
       const set: Partial<typeof llmConfigs.$inferInsert> = {
         name: input.name,
+        kind: input.kind,
         provider: input.provider,
         model: input.model,
         baseUrl: input.baseUrl || null,
@@ -100,6 +112,7 @@ export function createLlmConfigStore(db: WorkflowDb) {
         topP: input.topP ?? null,
         timeoutMs: input.timeoutMs,
         systemPrompt: input.systemPrompt || null,
+        dimension: input.kind === "embedding" ? (input.dimension ?? null) : null,
         updatedAt: new Date(),
       };
       if (input.apiKey !== undefined) set.apiKeyEncrypted = input.apiKey ? encryptSecret(input.apiKey) : null;
@@ -111,9 +124,14 @@ export function createLlmConfigStore(db: WorkflowDb) {
       await db.delete(llmConfigs).where(eq(llmConfigs.id, id));
     },
 
+    /** Unsets `isDefault` only within the target row's own `kind` — "chat" and "embedding" each keep
+     *  their own independent default, since they're picked from independently (a node picking a
+     *  default chat config vs. Code Search picking a default embedding config). */
     async setDefault(id: string): Promise<LlmConfigSummary | undefined> {
+      const target = await get(id);
+      if (!target) return undefined;
       await db.transaction(async (tx) => {
-        await tx.update(llmConfigs).set({ isDefault: false });
+        await tx.update(llmConfigs).set({ isDefault: false }).where(eq(llmConfigs.kind, target.kind));
         await tx.update(llmConfigs).set({ isDefault: true }).where(eq(llmConfigs.id, id));
       });
       return get(id);

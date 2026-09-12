@@ -1,5 +1,6 @@
 import {
   executeWorkflow,
+  type AiAgentLlmService,
   type AlertStoreService,
   type AnalysisResultStoreService,
   type TicketStoreService,
@@ -38,6 +39,7 @@ export interface RunnerServices {
   localGitClient: LocalGitClientService;
   gitCacheStore: GitCacheStoreService;
   analysisResultStore: AnalysisResultStoreService;
+  llmClient: AiAgentLlmService;
   /** Only set for a run triggered by a real inbound webhook call — see `/api/webhooks/:workflowId` in index.ts. */
   webhookRequest?: WebhookRequestPayload;
 }

@@ -358,16 +358,16 @@ export function buildGitHubSyncWorkflow(owner: string, repo: string): WorkflowDe
     createdAt: now,
     updatedAt: now,
     nodes: [
-      { id: "getRepo", type: "git", name: "Git: Get Repository", position: { x: 0, y: -180 }, parameters: { action: "Get Repository", owner, repo } },
+      { id: "getRepo", type: "github", name: "GitHub: Get Repository", position: { x: 0, y: -180 }, parameters: { action: "Get Repository", owner, repo } },
       { id: "cacheRepo", type: "gitCacheUpsert", name: "Cache: Repository", position: { x: 260, y: -180 }, parameters: { entity: "Repository", owner, repo } },
 
-      { id: "listBranches", type: "git", name: "Git: List Branches", position: { x: 0, y: -60 }, parameters: { action: "List Branches", owner, repo } },
+      { id: "listBranches", type: "github", name: "GitHub: List Branches", position: { x: 0, y: -60 }, parameters: { action: "List Branches", owner, repo } },
       { id: "cacheBranches", type: "gitCacheUpsert", name: "Cache: Branches", position: { x: 260, y: -60 }, parameters: { entity: "Branches", owner, repo } },
 
-      { id: "listPRs", type: "git", name: "Git: List Pull Requests", position: { x: 0, y: 60 }, parameters: { action: "List Pull Requests", owner, repo, state: "all" } },
+      { id: "listPRs", type: "github", name: "GitHub: List Pull Requests", position: { x: 0, y: 60 }, parameters: { action: "List Pull Requests", owner, repo, state: "all" } },
       { id: "cachePRs", type: "gitCacheUpsert", name: "Cache: Pull Requests", position: { x: 260, y: 60 }, parameters: { entity: "Pull Requests", owner, repo } },
 
-      { id: "listIssues", type: "git", name: "Git: List Issues", position: { x: 0, y: 180 }, parameters: { action: "List Issues", owner, repo, state: "all" } },
+      { id: "listIssues", type: "github", name: "GitHub: List Issues", position: { x: 0, y: 180 }, parameters: { action: "List Issues", owner, repo, state: "all" } },
       { id: "cacheIssues", type: "gitCacheUpsert", name: "Cache: Issues", position: { x: 260, y: 180 }, parameters: { entity: "Issues", owner, repo } },
     ],
     connections: [

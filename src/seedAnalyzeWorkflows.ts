@@ -8,11 +8,11 @@ export const ANALYZE_WORKITEM_LOCAL_SOURCE_WORKFLOW_ID = "w15-analyze-workitem-l
 /**
  * Rule-based health computation, shared shape between Analyze Cycle and Analyze Module (see
  * `docs/pm-workitem-workflows.md`'s output schema: status/healthScore/summary/risks/
- * recommendedActions/needsAlert/alertSeverity). `sendMessageToAiAgent` is still a stub today (see
- * `nodeTypes/sendMessageToAiAgent.ts`) — real LLM wiring is a separate, later piece of work — so the
- * numbers/status/risks below are computed deterministically from real data, and the AI step's
- * `response` is folded in as an additional line rather than replacing the computed summary. Once a
- * real AI client exists, swap that one line for the AI's own summary/recommendedActions.
+ * recommendedActions/needsAlert/alertSeverity). `sendMessageToAiAgent` now calls a real LLM (see
+ * `nodeTypes/sendMessageToAiAgent.ts` / `llmClient.ts`), so the AI step's `agentName` below must match
+ * an existing LLM Config's name (Settings → LLM Settings) or this workflow's run fails — the
+ * numbers/status/risks are still computed deterministically from real data first, and the AI's
+ * `response` is folded in as an additional line rather than replacing the computed summary.
  */
 const COMPUTE_CYCLE_HEALTH = `
 // Both upstream nodes feed this one node — separate them back out by shape (only a planning group
@@ -78,8 +78,7 @@ return items.map((item) => ({
 `.trim();
 
 const ASSEMBLE_CYCLE_RESULT = `
-// Folds the AI agent's (currently stub) response into the summary computed by the rule step above —
-// once sendMessageToAiAgent calls a real model, its response becomes the actual narrative summary.
+// Folds the AI agent's real response into the summary computed by the rule step above.
 return items.map((item) => ({
   json: {
     ...item.json,
@@ -92,7 +91,7 @@ const NEEDS_ALERT_IF_PARAMETERS = { field: "needsAlert", operator: "equals", val
 
 /**
  * "Analyze Cycle" from `pm-workitem-workflows.md`: planningGroup(cycle) + workItem -> code (compute
- * health) -> sendMessageToAiAgent (narrative, stub until real AI wiring) -> code (assemble) ->
+ * health) -> sendMessageToAiAgent (narrative, real LLM call) -> code (assemble) ->
  * analysisResultSave -> if(needsAlert) -> raiseAlert.
  */
 export function buildAnalyzeCycleWorkflow(): WorkflowDefinition {
@@ -208,7 +207,7 @@ return items.map((item) => ({
 /**
  * "Analyze Work Item Health" — a per-work-item health check, distinct from Analyze Cycle/Module
  * (which aggregate across a cycle/module's linked items). workItem(List) -> code (compute health,
- * one row per item, no aggregation) -> sendMessageToAiAgent (narrative, stub until real AI wiring) ->
+ * one row per item, no aggregation) -> sendMessageToAiAgent (narrative, real LLM call) ->
  * code (assemble) -> analysisResultSave(subjectType: "workItem") -> if(needsAlert) -> raiseAlert.
  * Backs the WorkItem detail panel's Health Status section (see GET /api/work-items/:id/health).
  */
@@ -453,9 +452,9 @@ return items.map((item) => ({
  * "Analyze Work Item Status (Local Source)" — like Analyze Work Item Health, but the signal is real
  * local git activity instead of due dates/priority: does a local branch matching the item's key
  * exist, and does that agree with the tracked status? Built for the "no GitHub connection, local
- * checkout only" case (see [[git_control_settings_and_local_source]]) via the \`git\` node's new
- * Local source. workItem(List) + git(source: Local, List Branches) -> code (correlate) ->
- * sendMessageToAiAgent (narrative, stub until real AI wiring) -> code (assemble) ->
+ * checkout only" case (see [[git_control_settings_and_local_source]]) via the local-only \`git\`
+ * node (separate from the \`github\` node). workItem(List) + git(List Branches) -> code (correlate) ->
+ * sendMessageToAiAgent (narrative, real LLM call) -> code (assemble) ->
  * analysisResultSave(subjectType: "workItem") -> if(needsAlert) -> raiseAlert. Deliberately a
  * separate workflow from Analyze Work Item Health (different input signal) rather than merged into
  * it — both write to the same analysisResultStore subject (subjectType "workItem", subjectId = the
@@ -476,7 +475,7 @@ export function buildAnalyzeWorkItemLocalSourceWorkflow(): WorkflowDefinition {
         type: "git",
         name: "Git — Local Branches",
         position: { x: 0, y: 60 },
-        parameters: { source: "Local", action: "List Branches" },
+        parameters: { action: "List Branches" },
       },
       { id: "correlate", type: "code", name: "Correlate With Local Branches", position: { x: 260, y: 0 }, parameters: { code: COMPUTE_WORKITEM_LOCAL_SOURCE_STATUS } },
       { id: "aiPrompt", type: "code", name: "Build AI Prompt", position: { x: 520, y: 0 }, parameters: { code: AI_PROMPT_WORKITEM_LOCAL_SOURCE } },

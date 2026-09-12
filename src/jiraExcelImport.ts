@@ -13,9 +13,67 @@ const COLUMN_ALIASES: Record<string, string[]> = {
   priority: ["priority"],
   assignee: ["assignee"],
   projectKey: ["project key", "project"],
-  storyPoints: ["story points", "custom field (story points)"],
+  storyPoints: ["story points", "custom field (story points)", "story point", "original story points"],
   sprint: ["sprint"],
+  issueType: ["issue type", "type"],
+  epicLink: ["epic link"],
+  epicName: ["epic name"],
+  components: ["component/s", "components"],
+  fixVersions: ["fix version/s", "fix versions"],
+  labels: ["labels"],
+  dueDate: ["due date"],
 };
+
+/**
+ * Jira's own export puts multiple values for a multi-select field (Components, Fix Version/s, Labels)
+ * in one cell, separated by a comma or a newline — never both consistently, so split on either.
+ */
+function splitMultiValue(raw: unknown): string[] | undefined {
+  const value = String(raw ?? "").trim();
+  if (!value) return undefined;
+  const parts = value
+    .split(/[,\n]/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+  return parts.length > 0 ? parts : undefined;
+}
+
+/**
+ * A date-like cell in a CSV export gets type-inferred by `xlsx` into an Excel date serial number
+ * (e.g. `46295` for "30-Sep-26"), not a string — so it needs the standard Excel-epoch conversion rather
+ * than `new Date(String(value))`, which would silently mis-parse the raw serial number as a garbage
+ * date instead. (Not using `XLSX.SSF.parse_date_code` here: under Node ESM, `import * as XLSX` only
+ * exposes the named exports `cjs-module-lexer` can statically find, which misses `SSF` — it's only
+ * reachable as `XLSX.default.SSF` there, so the direct epoch math below is used instead.) A genuine
+ * text export (a real `.xlsx` typically doesn't hit this) still falls back to plain string parsing.
+ */
+function parseDueDate(value: unknown): string | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  if (typeof value === "number") {
+    // Excel's day-0 is 1899-12-30 (its epoch, adjusted for the 1900 leap-year bug); 25569 is the
+    // number of days from there to the Unix epoch (1970-01-01) — the standard SheetJS conversion.
+    const utcMs = Math.round((value - 25569) * 86400 * 1000);
+    const asDate = new Date(utcMs);
+    return Number.isNaN(asDate.getTime()) ? undefined : asDate.toISOString().slice(0, 10);
+  }
+  const asDate = new Date(String(value).trim());
+  return Number.isNaN(asDate.getTime()) ? undefined : asDate.toISOString().slice(0, 10);
+}
+
+/**
+ * Short, deterministic id for a row that has no Jira issue key — this app's own backlog/planning
+ * exports (e.g. a wider "general_report" dump covering both real Jira issues and not-yet-ticketed
+ * feature rows) can have plenty of rows like that. Derived from the project + title so the same row
+ * re-imported later upserts in place instead of duplicating, without needing a real Jira key to key off.
+ */
+function syntheticKey(projectKey: string, title: string): string {
+  let hash = 0;
+  const input = `${projectKey}|${title}`;
+  for (let i = 0; i < input.length; i++) {
+    hash = (hash * 31 + input.charCodeAt(i)) | 0;
+  }
+  return `${projectKey || "ROW"}-NOKEY-${(hash >>> 0).toString(36)}`;
+}
 
 function normalizeHeader(header: string): string {
   return header.trim().toLowerCase();
@@ -106,31 +164,45 @@ export function parseJiraExcelImport(buffer: Buffer): JiraExcelImportResult {
   let skipped = 0;
 
   for (const row of rows) {
-    const key = String(row[keyColumn] ?? "").trim();
     const title = String(row[titleColumn] ?? "").trim();
-    if (!key || !title) {
+    if (!title) {
       skipped += 1;
       continue;
     }
 
     const projectKey = columns.projectKey ? String(row[columns.projectKey] ?? "").trim() : "";
+    // Not every row in a wide planning export (e.g. a backlog dump covering both real Jira issues and
+    // not-yet-ticketed feature rows) carries a real Jira issue key — those still get imported (title is
+    // the only hard requirement) under a synthetic, deterministic key instead of being dropped.
+    const rawKey = String(row[keyColumn] ?? "").trim();
+    const key = rawKey || syntheticKey(projectKey, title);
+
     const storyPointsRaw = columns.storyPoints ? row[columns.storyPoints] : undefined;
     const storyPoints =
       storyPointsRaw !== undefined && storyPointsRaw !== "" && !Number.isNaN(Number(storyPointsRaw))
         ? Number(storyPointsRaw)
         : undefined;
 
+    const dueDate = columns.dueDate ? parseDueDate(row[columns.dueDate]) : undefined;
+
     tickets.push({
       provider: "jira",
       externalId: key,
       externalKey: key,
-      projectKey: projectKey || key.split("-")[0],
+      projectKey: projectKey || (rawKey ? rawKey.split("-")[0] : "") || "ROW",
       title,
       status: columns.status ? String(row[columns.status] ?? "").trim() || "Unknown" : "Unknown",
       priority: columns.priority ? String(row[columns.priority] ?? "").trim() || undefined : undefined,
       assignee: columns.assignee ? String(row[columns.assignee] ?? "").trim() || undefined : undefined,
       storyPoints,
       sprintId: columns.sprint ? String(row[columns.sprint] ?? "").trim() || undefined : undefined,
+      issueType: columns.issueType ? String(row[columns.issueType] ?? "").trim() || undefined : undefined,
+      epicKey: columns.epicLink ? String(row[columns.epicLink] ?? "").trim() || undefined : undefined,
+      epicName: columns.epicName ? String(row[columns.epicName] ?? "").trim() || undefined : undefined,
+      components: columns.components ? splitMultiValue(row[columns.components]) : undefined,
+      fixVersions: columns.fixVersions ? splitMultiValue(row[columns.fixVersions]) : undefined,
+      labels: columns.labels ? splitMultiValue(row[columns.labels]) : undefined,
+      dueDate,
       raw: row,
     });
   }

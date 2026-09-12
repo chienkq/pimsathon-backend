@@ -14,6 +14,103 @@ export interface LocalGitFileSnippet {
   content: string;
 }
 
+export interface LocalGitStatus {
+  currentBranch: string;
+  ahead: number;
+  behind: number;
+  staged: string[];
+  modified: string[];
+  notAdded: string[];
+  deleted: string[];
+  conflicted: string[];
+  isClean: boolean;
+}
+
+export interface LocalGitLogEntry {
+  hash: string;
+  message: string;
+  authorName: string;
+  authorEmail: string;
+  date: string;
+}
+
+export interface LocalGitConfigEntry {
+  key: string;
+  value: string;
+}
+
+export interface LocalGitProjectFile {
+  path: string;
+  content: string;
+  bytes: number;
+}
+
+export interface LocalGitProjectFiles {
+  files: LocalGitProjectFile[];
+  fileCount: number;
+  totalBytes: number;
+  truncated: boolean;
+}
+
+/** Extensions never worth reading as text — binary/generated, would just burn the size budget. */
+const SKIP_EXTENSIONS = new Set([
+  ".png", ".jpg", ".jpeg", ".gif", ".ico", ".webp", ".bmp", ".svg",
+  ".pdf", ".woff", ".woff2", ".ttf", ".eot",
+  ".zip", ".gz", ".tar", ".7z", ".rar",
+  ".mp4", ".mp3", ".wav", ".mov", ".avi",
+  ".wasm", ".node", ".exe", ".dll", ".so", ".dylib",
+]);
+/** Exact filenames skipped regardless of extension — huge, machine-generated, not source code. */
+const SKIP_FILENAMES = new Set(["pnpm-lock.yaml", "package-lock.json", "yarn.lock"]);
+/** Any single file over this size is skipped outright rather than eating the whole total-size budget. */
+const MAX_SINGLE_FILE_BYTES = 100_000;
+/** Safety cap on how many tracked paths `git ls-files` results are even considered, before size filtering. */
+const MAX_CANDIDATE_FILES = 5_000;
+
+/** Parses `git status --porcelain=v1 -b` output — first line is the branch/tracking header
+ *  (e.g. "## main...origin/main [ahead 1, behind 2]"), remaining lines are two-letter XY status
+ *  codes per path (see git-status(1) short format). */
+function parseStatusPorcelain(stdout: string): LocalGitStatus {
+  const lines = stdout.split("\n").filter(Boolean);
+  const header = lines[0] ?? "## ";
+  const branchMatch = header.match(/^##\s+([^.\s]+)/);
+  const aheadMatch = header.match(/ahead (\d+)/);
+  const behindMatch = header.match(/behind (\d+)/);
+
+  const staged: string[] = [];
+  const modified: string[] = [];
+  const notAdded: string[] = [];
+  const deleted: string[] = [];
+  const conflicted: string[] = [];
+
+  for (const line of lines.slice(1)) {
+    const x = line[0];
+    const y = line[1];
+    const file = line.slice(3);
+    if (x === "U" || y === "U" || (x === "A" && y === "A") || (x === "D" && y === "D")) conflicted.push(file);
+    else {
+      if (x !== " " && x !== "?") staged.push(file);
+      if (y === "M") modified.push(file);
+      if (y === "D") deleted.push(file);
+      if (x === "?" && y === "?") notAdded.push(file);
+    }
+  }
+
+  return {
+    currentBranch: branchMatch?.[1] ?? "",
+    ahead: aheadMatch ? Number(aheadMatch[1]) : 0,
+    behind: behindMatch ? Number(behindMatch[1]) : 0,
+    staged,
+    modified,
+    notAdded,
+    deleted,
+    conflicted,
+    isClean: staged.length === 0 && modified.length === 0 && notAdded.length === 0 && deleted.length === 0 && conflicted.length === 0,
+  };
+}
+
+const LOG_FIELD_SEP = "\x1f";
+
 /** Resolves `filePath` against `repoPath` and rejects anything that escapes the repo folder (e.g. `../../etc/passwd`). */
 function resolveWithinRepo(repoPath: string, filePath: string): string {
   const repoRoot = path.resolve(repoPath);
@@ -59,6 +156,105 @@ export function createLocalGitClient(config: { repoPath: string }) {
       const needle = query.toLowerCase();
       return unique.filter((name) => name.toLowerCase().includes(needle));
     },
+
+    /** `git fetch` — updates remote-tracking refs from the remote; leaves the working tree and
+     *  local branches untouched (n8n's Git node classifies this the same way). */
+    async fetch(): Promise<{ success: true }> {
+      await execFileAsync("git", ["-C", config.repoPath, "fetch"]);
+      return { success: true };
+    },
+
+    /** `git status --porcelain=v1 -b`, parsed — read-only working-tree state, no writes. */
+    async getStatus(): Promise<LocalGitStatus> {
+      const { stdout } = await execFileAsync("git", ["-C", config.repoPath, "status", "--porcelain=v1", "-b"]);
+      return parseStatusPorcelain(stdout);
+    },
+
+    /** `git log`, parsed — defaults to the current branch, most recent `maxCount` commits (default 20). */
+    async getLog(options?: { maxCount?: number; branch?: string }): Promise<LocalGitLogEntry[]> {
+      const maxCount = Math.min(Math.max(options?.maxCount ?? 20, 1), 200);
+      const args = [
+        "-C",
+        config.repoPath,
+        "log",
+        `-n${maxCount}`,
+        `--format=%H${LOG_FIELD_SEP}%s${LOG_FIELD_SEP}%an${LOG_FIELD_SEP}%ae${LOG_FIELD_SEP}%aI`,
+      ];
+      if (options?.branch) args.push(options.branch);
+      const { stdout } = await execFileAsync("git", args);
+      return stdout
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => {
+          const [hash, message, authorName, authorEmail, date] = line.split(LOG_FIELD_SEP);
+          return { hash, message, authorName, authorEmail, date };
+        });
+    },
+
+    /** `git config --list`, parsed into key/value pairs — read-only (no `Add Config`/writes). */
+    async getConfigList(): Promise<LocalGitConfigEntry[]> {
+      const { stdout } = await execFileAsync("git", ["-C", config.repoPath, "config", "--list"]);
+      return stdout
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => {
+          const eq = line.indexOf("=");
+          return eq === -1 ? { key: line, value: "" } : { key: line.slice(0, eq), value: line.slice(eq + 1) };
+        });
+    },
+
+    /** `git ls-files` (already respects `.gitignore`) with each tracked text file's contents inlined,
+     *  under a combined byte budget — the source for an AI Agent node to reason over "the whole
+     *  project" without shipping the entire checkout (binaries, lockfiles, and oversized files are
+     *  skipped; `truncated` reports whether the budget or file-count cap cut the walk short). */
+    async listProjectFiles(options?: { maxTotalBytes?: number }): Promise<LocalGitProjectFiles> {
+      const maxTotalBytes = Math.max(1, options?.maxTotalBytes ?? 500_000);
+      const { stdout } = await execFileAsync("git", ["-C", config.repoPath, "ls-files"], {
+        maxBuffer: 10 * 1024 * 1024,
+      });
+      const allPaths = stdout.split("\n").map((line) => line.trim()).filter(Boolean);
+      const candidates = allPaths.slice(0, MAX_CANDIDATE_FILES);
+
+      const files: LocalGitProjectFile[] = [];
+      let totalBytes = 0;
+      let truncated = allPaths.length > candidates.length;
+
+      for (const relPath of candidates) {
+        if (totalBytes >= maxTotalBytes) {
+          truncated = true;
+          break;
+        }
+        const ext = path.extname(relPath).toLowerCase();
+        if (SKIP_EXTENSIONS.has(ext) || SKIP_FILENAMES.has(path.basename(relPath))) continue;
+
+        let resolved: string;
+        try {
+          resolved = resolveWithinRepo(config.repoPath, relPath);
+        } catch {
+          continue;
+        }
+
+        const stat = await fs.stat(resolved).catch(() => undefined);
+        if (!stat || !stat.isFile()) continue;
+        if (stat.size > MAX_SINGLE_FILE_BYTES) {
+          truncated = true;
+          continue;
+        }
+
+        const raw = await fs.readFile(resolved, "utf-8").catch(() => undefined);
+        if (raw === undefined || raw.includes(" ")) continue; // unreadable, or binary (NUL byte heuristic)
+
+        const bytes = Buffer.byteLength(raw, "utf-8");
+        if (totalBytes + bytes > maxTotalBytes) {
+          truncated = true;
+          break;
+        }
+        files.push({ path: relPath, content: raw, bytes });
+        totalBytes += bytes;
+      }
+
+      return { files, fileCount: files.length, totalBytes, truncated };
+    },
   };
 }
 
@@ -81,6 +277,21 @@ export function createLocalGitClientFromCredentials(credentialStore: CredentialS
     },
     async listBranches(query?: string) {
       return (await requireClient()).listBranches(query);
+    },
+    async fetch() {
+      return (await requireClient()).fetch();
+    },
+    async getStatus() {
+      return (await requireClient()).getStatus();
+    },
+    async getLog(options?: { maxCount?: number; branch?: string }) {
+      return (await requireClient()).getLog(options);
+    },
+    async getConfigList() {
+      return (await requireClient()).getConfigList();
+    },
+    async listProjectFiles(options?: { maxTotalBytes?: number }) {
+      return (await requireClient()).listProjectFiles(options);
     },
   };
 }

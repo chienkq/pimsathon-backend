@@ -56,8 +56,9 @@ import { createLlmConfigStore, type LlmConfigInput } from "./llmConfigStore.js";
 import { listLlmModels, testLlmConfig } from "./llmProviderTest.js";
 import { createLocalGitClientFromCredentials, testLocalGitConnection } from "./localGitClient.js";
 import { parseJiraExcelImport } from "./jiraExcelImport.js";
-import { convertTicketsToWorkItems } from "./jiraTicketToWorkItem.js";
+import { convertNamesToPlanningGroups, convertTicketsToWorkItems, previewTicketConversions } from "./jiraTicketToWorkItem.js";
 import { createJiraImportJobStore } from "./jiraImportJobs.js";
+import { createLlmClient } from "./llmClient.js";
 import { createOutlookClient } from "./outlookClient.js";
 import { ensureWorkflowRow, resolveWorkflow, runWorkflow, type RunnerServices } from "./runner.js";
 import { scheduleWorkflow } from "./scheduler.js";
@@ -101,8 +102,9 @@ const llmConfigStore = createLlmConfigStore(db);
 const appSettingsStore = createAppSettingsStore(db);
 const jiraImportJobs = createJiraImportJobStore();
 const ticketSyncConflictStore = createTicketSyncConflictStore(db);
-// Full-typed (getFileSnippet + listBranches) — also used directly by the `/api/local-git/*` routes
-// below, not just as the narrower `LocalGitClientService` the `git` node's Local source asks for.
+// Full-typed (getFileSnippet + listBranches/getStatus/getLog/getConfigList) — also used directly by
+// the `/api/local-git/*` routes below, not just as the narrower `LocalGitClientService` the `git`
+// node asks for.
 const localGitClient = createLocalGitClientFromCredentials(credentialStore);
 const services: RunnerServices = {
   jiraClient: createJiraClientFromCredentials(credentialStore),
@@ -115,6 +117,7 @@ const services: RunnerServices = {
   localGitClient,
   gitCacheStore: createGitCacheStore(db),
   analysisResultStore: createAnalysisResultStore(db),
+  llmClient: createLlmClient(llmConfigStore),
 };
 
 await seedPlatformData(db);
@@ -772,13 +775,15 @@ app.post("/api/issue-links", async (request, reply) => {
 });
 
 // admin-ui's "connect a repository to a project" — the only write this backend accepts for
-// GitHub data today. `projectId: null` disconnects.
-app.patch("/api/repositories/:id/connect", async (request, reply) => {
+// GitHub data today. The link lives on the project (one repo per project, but a repo can be
+// linked to several projects), so this is a project-scoped route. `repositoryId: null` disconnects;
+// setting it to a different repo re-points the project (this is how "change repository" works).
+app.patch("/api/projects/:id/repository", async (request, reply) => {
   const { id } = request.params as { id: string };
-  const { projectId } = request.body as { projectId: string | null | undefined };
-  if (projectId === undefined)
-    return reply.code(400).send({ error: "Body must include `projectId` (string or null)." });
-  await db.update(repositories).set({ projectId }).where(eq(repositories.id, id));
+  const { repositoryId } = request.body as { repositoryId: string | null | undefined };
+  if (repositoryId === undefined)
+    return reply.code(400).send({ error: "Body must include `repositoryId` (string or null)." });
+  await db.update(projects).set({ repositoryId }).where(eq(projects.id, id));
   return { status: "success" };
 });
 
@@ -1178,6 +1183,23 @@ app.get("/api/tickets", async (request) => {
   };
 });
 
+// Read-only "what would happen" preview ahead of the real convert below — the Jira Sync screen's
+// "Preview changes" button, so a silent overwrite (conversion always replaces description/labels/
+// cycle/module/due date/story points, only title/status/priority go through a three-way merge) is
+// visible before it happens, not just after.
+app.post("/api/tickets/convert-to-work-items/preview", async (request, reply) => {
+  const { ids } = (request.body as { ids?: string[] } | undefined) ?? {};
+  if (!ids || ids.length === 0) return reply.code(400).send({ error: "Body must include a non-empty `ids` array." });
+
+  const allTickets = await services.ticketStore.queryTickets({});
+  const idSet = new Set(ids);
+  const tickets = allTickets.filter((ticket) => idSet.has(ticket.id));
+  if (tickets.length === 0) return reply.code(404).send({ error: "No matching tickets found." });
+
+  const previews = await previewTicketConversions(db, tickets);
+  return { previews };
+});
+
 // Converting a Jira ticket into a real platform work item is a deliberate, user-picked action (not
 // automatic on import/sync) — the Jira data dialog lets the user select which rows to convert. Matched
 // on (provider, externalKey) via jiraTicketToWorkItem.ts, so re-converting an already-converted ticket
@@ -1193,6 +1215,30 @@ app.post("/api/tickets/convert-to-work-items", async (request, reply) => {
 
   const { created, updated } = await convertTicketsToWorkItems(db, tickets, projectId);
   return { status: "success", created, updated };
+});
+
+// The Jira Sync screen's "Sprints" and "Modules" sections — a deliberate, reviewable pre-step ahead of
+// converting work items: turns the distinct Sprint (or Fix Version/s) values found across the imported
+// tickets straight into cycles (or modules) in `projectId`, so a messy/duplicate Jira name can be
+// caught and fixed before it lands as a cycle/module, rather than only ever being created silently as a
+// side effect of "Convert to work items" (which still happens too, as a fallback — see
+// jiraTicketToWorkItem.ts's `mapTicketToPlanningGroups`).
+app.post("/api/tickets/convert-to-cycles", async (request, reply) => {
+  const { names, projectId } = (request.body as { names?: string[]; projectId?: string } | undefined) ?? {};
+  if (!names || names.length === 0) return reply.code(400).send({ error: "Body must include a non-empty `names` array." });
+  if (!projectId) return reply.code(400).send({ error: "Body must include `projectId`." });
+
+  const result = await convertNamesToPlanningGroups(db, projectId, "cycle", names);
+  return { status: "success", ...result };
+});
+
+app.post("/api/tickets/convert-to-modules", async (request, reply) => {
+  const { names, projectId } = (request.body as { names?: string[]; projectId?: string } | undefined) ?? {};
+  if (!names || names.length === 0) return reply.code(400).send({ error: "Body must include a non-empty `names` array." });
+  if (!projectId) return reply.code(400).send({ error: "Body must include `projectId`." });
+
+  const result = await convertNamesToPlanningGroups(db, projectId, "module", names);
+  return { status: "success", ...result };
 });
 
 // Left behind by the three-way merge in convertTicketsToWorkItems() above when both the app and Jira

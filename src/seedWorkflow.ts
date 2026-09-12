@@ -1,4 +1,4 @@
-import type { WorkflowDefinition } from "@chienkq/workflow-core";
+import type { FilterValue, WorkflowDefinition } from "@chienkq/workflow-core";
 import type { CredentialStore } from "./credentialStore.js";
 import { env } from "./env.js";
 
@@ -67,7 +67,15 @@ export function buildAlertEngineWorkflow(): WorkflowDefinition {
         type: "workItem",
         name: "Work Item",
         position: { x: 0, y: 0 },
-        parameters: { action: "List", priority: "Urgent" },
+        parameters: {
+          action: "List",
+          filters: {
+            combinator: "and",
+            conditions: [
+              { id: "priority-urgent", leftField: "priority", operator: { type: "string", operation: "equals" }, rightValue: "Urgent" },
+            ],
+          } satisfies FilterValue,
+        },
       },
       {
         id: "staleUrgentRule",

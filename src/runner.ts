@@ -5,6 +5,7 @@ import {
   type TicketStoreService,
   type GitCacheStoreService,
   type GitClientService,
+  type LocalGitClientService,
   type JiraClientService,
   type PlanningGroupStoreService,
   type WebhookRequestPayload,
@@ -34,6 +35,7 @@ export interface RunnerServices {
   widgetStore: WidgetStoreService;
   planningGroupStore: PlanningGroupStoreService;
   gitClient: GitClientService;
+  localGitClient: LocalGitClientService;
   gitCacheStore: GitCacheStoreService;
   analysisResultStore: AnalysisResultStoreService;
   /** Only set for a run triggered by a real inbound webhook call — see `/api/webhooks/:workflowId` in index.ts. */

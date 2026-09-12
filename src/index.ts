@@ -1,9 +1,16 @@
 import {
+  executeSingleNode,
   getIntegrationProvider,
+  getLlmProvider,
+  GIT_CONTROL_PROVIDER_IDS,
   INTEGRATION_PROVIDERS,
   listNodeTypeMetas,
+  LLM_PROVIDERS,
   WORK_ITEM_STATUSES,
+  type GitControlDefaultSource,
   type IntegrationProviderId,
+  type LlmProviderId,
+  type NodeExecutionData,
   type WorkflowDefinition,
   type WorkflowNodeDefinition,
 } from "@chienkq/workflow-core";
@@ -36,6 +43,7 @@ import {
   type AdminUiPlanningGroupFields,
   type AdminUiWorkItemFields,
 } from "./adminUiSync.js";
+import { createAppSettingsStore } from "./appSettingsStore.js";
 import { createCredentialStore } from "./credentialStore.js";
 import { env } from "./env.js";
 import { createTicketStore } from "./ticketStore.js";
@@ -44,6 +52,9 @@ import { createGitCacheStore } from "./gitCacheStore.js";
 import { createGitClientFromCredentials, listAccountRepositories } from "./githubClient.js";
 import { createGmailClient } from "./gmailClient.js";
 import { createJiraClientFromCredentials } from "./jiraClient.js";
+import { createLlmConfigStore, type LlmConfigInput } from "./llmConfigStore.js";
+import { listLlmModels, testLlmConfig } from "./llmProviderTest.js";
+import { createLocalGitClientFromCredentials, testLocalGitConnection } from "./localGitClient.js";
 import { parseJiraExcelImport } from "./jiraExcelImport.js";
 import { convertTicketsToWorkItems } from "./jiraTicketToWorkItem.js";
 import { createJiraImportJobStore } from "./jiraImportJobs.js";
@@ -72,9 +83,11 @@ import {
   ANALYZE_CYCLE_WORKFLOW_ID,
   ANALYZE_MODULE_WORKFLOW_ID,
   ANALYZE_WORKITEM_HEALTH_WORKFLOW_ID,
+  ANALYZE_WORKITEM_LOCAL_SOURCE_WORKFLOW_ID,
   buildAnalyzeCycleWorkflow,
   buildAnalyzeModuleWorkflow,
   buildAnalyzeWorkItemHealthWorkflow,
+  buildAnalyzeWorkItemLocalSourceWorkflow,
 } from "./seedAnalyzeWorkflows.js";
 import { createPlanningGroupStore } from "./planningGroupStore.js";
 import { getProjectHealth } from "./projectHealth.js";
@@ -84,8 +97,13 @@ import { createWorkItemStore } from "./workItemStore.js";
 const db = createDb(env.databaseUrl);
 const workflowStore = createWorkflowStore(db);
 const credentialStore = createCredentialStore(db);
+const llmConfigStore = createLlmConfigStore(db);
+const appSettingsStore = createAppSettingsStore(db);
 const jiraImportJobs = createJiraImportJobStore();
 const ticketSyncConflictStore = createTicketSyncConflictStore(db);
+// Full-typed (getFileSnippet + listBranches) — also used directly by the `/api/local-git/*` routes
+// below, not just as the narrower `LocalGitClientService` the `git` node's Local source asks for.
+const localGitClient = createLocalGitClientFromCredentials(credentialStore);
 const services: RunnerServices = {
   jiraClient: createJiraClientFromCredentials(credentialStore),
   ticketStore: createTicketStore(db),
@@ -94,6 +112,7 @@ const services: RunnerServices = {
   widgetStore: createWidgetStore(db),
   planningGroupStore: createPlanningGroupStore(db),
   gitClient: createGitClientFromCredentials(credentialStore),
+  localGitClient,
   gitCacheStore: createGitCacheStore(db),
   analysisResultStore: createAnalysisResultStore(db),
 };
@@ -138,6 +157,11 @@ const registeredWorkflows = {
   },
   [ANALYZE_WORKITEM_HEALTH_WORKFLOW_ID]: {
     workflow: buildAnalyzeWorkItemHealthWorkflow(),
+    cron: "0 */2 * * *",
+    connectorProvider: undefined,
+  },
+  [ANALYZE_WORKITEM_LOCAL_SOURCE_WORKFLOW_ID]: {
+    workflow: buildAnalyzeWorkItemLocalSourceWorkflow(),
     cron: "0 */2 * * *",
     connectorProvider: undefined,
   },
@@ -260,6 +284,21 @@ app.post("/api/workflows/:id/run", async (request, reply) => {
   }
 });
 
+// The NDV "Execute" button — runs one node type in isolation against the real backend services
+// (e.g. the workItem node's Jira/DB-backed CRUD), bypassing the graph. `input` is whatever the
+// editor already resolved client-side from the upstream node's last result.
+app.post("/api/node-types/:type/execute", async (request, reply) => {
+  const { type } = request.params as { type: string };
+  const { parameters, input } = (request.body as { parameters?: Record<string, unknown>; input?: NodeExecutionData[] } | undefined) ?? {};
+  try {
+    const result = await executeSingleNode(type, parameters ?? {}, input ?? [], services as unknown as Record<string, unknown>);
+    if (result.status === "error") return reply.code(502).send(result);
+    return result;
+  } catch (error) {
+    return reply.code(500).send({ status: "error", error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
 // Run history for the editor's Run Logs panel — every `runWorkflow` call (scheduled, webhook, or
 // manual) already writes a row to `workflow_runs`, this just exposes it. List omits `output` (can
 // be large and isn't needed for the row view); detail includes it for the timeline.
@@ -346,7 +385,111 @@ app.get("/api/alerts", async (request) => {
 // admin-ui's `state/store.tsx`), which is what makes the two sides agree on identity.
 app.get("/api/projects", async () => ({ projects: await db.select().from(projects) }));
 
+function parseProjectInput(body: unknown): { name: string; code: string; description: string; memberIds: string[] } {
+  const input = (body ?? {}) as Partial<{ name: string; code: string; description: string; memberIds: string[] }>;
+  if (!input.name?.trim()) throw new Error("Name is required.");
+  if (!input.code?.trim()) throw new Error("Code is required.");
+  return {
+    name: input.name.trim(),
+    code: input.code.trim(),
+    description: input.description?.trim() ?? "",
+    memberIds: Array.isArray(input.memberIds) ? input.memberIds : [],
+  };
+}
+
+app.post("/api/projects", async (request, reply) => {
+  try {
+    const [project] = await db
+      .insert(projects)
+      .values({ id: crypto.randomUUID(), color: "#496ce0", nextNumber: 1, ...parseProjectInput(request.body) })
+      .returning();
+    return reply.code(201).send({ project });
+  } catch (error) {
+    return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.put("/api/projects/:id", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const [existing] = await db.select().from(projects).where(eq(projects.id, id));
+  if (!existing) return reply.code(404).send({ error: `Unknown project: ${id}` });
+  try {
+    const [project] = await db
+      .update(projects)
+      .set(parseProjectInput(request.body))
+      .where(eq(projects.id, id))
+      .returning();
+    return { project };
+  } catch (error) {
+    return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.delete("/api/projects/:id", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const [existing] = await db.select().from(projects).where(eq(projects.id, id));
+  if (!existing) return reply.code(404).send({ error: `Unknown project: ${id}` });
+  await db.delete(projects).where(eq(projects.id, id));
+  return { status: "success" };
+});
+
 app.get("/api/members", async () => ({ members: await db.select().from(members) }));
+
+function parseMemberInput(body: unknown): { name: string; initials: string; color: string; login: string } {
+  const input = (body ?? {}) as Partial<{ name: string; initials: string; color: string; login: string }>;
+  if (!input.name?.trim()) throw new Error("Name is required.");
+  if (!input.login?.trim()) throw new Error("Login is required.");
+  const name = input.name.trim();
+  return {
+    name,
+    initials:
+      input.initials?.trim() ||
+      name
+        .split(/\s+/)
+        .map((part) => part[0])
+        .join("")
+        .slice(0, 2)
+        .toUpperCase(),
+    color: input.color?.trim() || "#6366f1",
+    login: input.login.trim(),
+  };
+}
+
+app.post("/api/members", async (request, reply) => {
+  try {
+    const [member] = await db
+      .insert(members)
+      .values({ id: crypto.randomUUID(), ...parseMemberInput(request.body) })
+      .returning();
+    return reply.code(201).send({ member });
+  } catch (error) {
+    return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.put("/api/members/:id", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const [existing] = await db.select().from(members).where(eq(members.id, id));
+  if (!existing) return reply.code(404).send({ error: `Unknown member: ${id}` });
+  try {
+    const [member] = await db
+      .update(members)
+      .set(parseMemberInput(request.body))
+      .where(eq(members.id, id))
+      .returning();
+    return { member };
+  } catch (error) {
+    return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.delete("/api/members/:id", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const [existing] = await db.select().from(members).where(eq(members.id, id));
+  if (!existing) return reply.code(404).send({ error: `Unknown member: ${id}` });
+  await db.delete(members).where(eq(members.id, id));
+  return { status: "success" };
+});
 
 app.get("/api/work-items", async () => ({ workItems: await services.workItemStore.list({}) }));
 
@@ -673,6 +816,7 @@ app.get("/api/integrations", async () => {
         placeholder,
         helpText,
       })),
+      category: provider.category,
       connected: configured.has(provider.id),
       status: statusByProvider.get(provider.id) ?? null,
     })),
@@ -743,6 +887,8 @@ async function testIntegration(provider: IntegrationProviderId): Promise<{ ok: b
         refreshToken: config.refreshToken,
         fromEmail: config.fromEmail,
       }).testConnection();
+    case "local-git":
+      return testLocalGitConnection(config.repoPath);
   }
 }
 
@@ -772,6 +918,187 @@ app.post("/api/integrations/:provider/test", async (request, reply) => {
       });
     return reply.code(502).send({ status: "error", error: message });
   }
+});
+
+// LLM Settings screen (Automation sidebar) — CRUD named LLM setups (provider + model + generation
+// params) that AI-flavored nodes can be pointed at. API keys are AES-256-GCM encrypted at rest
+// (llmConfigStore.ts) and never echoed back to the client — `list`/`get` only report `hasApiKey`.
+app.get("/api/llm-providers", async () => ({
+  providers: LLM_PROVIDERS.map((p) => ({
+    id: p.id,
+    displayName: p.displayName,
+    description: p.description,
+    color: p.color,
+    connectionFields: p.connectionFields,
+    defaultModel: p.defaultModel,
+    modelPlaceholder: p.modelPlaceholder,
+  })),
+}));
+
+app.get("/api/llm-configs", async () => ({ configs: await llmConfigStore.list() }));
+
+/**
+ * `keepExistingApiKey` is true when updating a config that already has a stored key and the request
+ * left `apiKey` blank — that means "leave it as-is", not "this provider needs no key", so the
+ * required-field check is skipped for just that case.
+ */
+function parseLlmConfigInput(body: unknown, keepExistingApiKey = false): LlmConfigInput {
+  const input = (body ?? {}) as Partial<LlmConfigInput> & { provider?: string };
+  const spec = getLlmProvider(input.provider ?? "");
+  if (!spec) throw new Error(`Unknown LLM provider: ${input.provider}`);
+  if (!input.name?.trim()) throw new Error("Name is required.");
+  if (!input.model?.trim()) throw new Error("Model is required.");
+
+  const extra: Record<string, string> = {};
+  const missing: string[] = [];
+  for (const field of spec.connectionFields) {
+    if (field.key === "apiKey" || field.key === "baseUrl") continue;
+    const value = (input.extra as Record<string, string> | undefined)?.[field.key];
+    if (field.required && !value?.trim()) missing.push(field.label);
+    if (value) extra[field.key] = value.trim();
+  }
+  const needsApiKey = spec.connectionFields.some((f) => f.key === "apiKey" && f.required);
+  if (needsApiKey && !input.apiKey && !keepExistingApiKey) missing.push("API Key");
+  const needsBaseUrl = spec.connectionFields.some((f) => f.key === "baseUrl" && f.required);
+  if (needsBaseUrl && !input.baseUrl?.trim()) missing.push("Base URL");
+  if (missing.length > 0) throw new Error(`Missing required field(s): ${missing.join(", ")}`);
+
+  return {
+    name: input.name.trim(),
+    provider: spec.id as LlmProviderId,
+    model: input.model.trim(),
+    apiKey: input.apiKey,
+    baseUrl: input.baseUrl?.trim(),
+    extra,
+    temperature: input.temperature ?? 0.7,
+    maxTokens: input.maxTokens ?? 1024,
+    topP: input.topP,
+    timeoutMs: input.timeoutMs ?? 60000,
+    systemPrompt: input.systemPrompt?.trim(),
+  };
+}
+
+app.post("/api/llm-configs", async (request, reply) => {
+  try {
+    const config = await llmConfigStore.create(parseLlmConfigInput(request.body));
+    return reply.code(201).send({ config });
+  } catch (error) {
+    return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.put("/api/llm-configs/:id", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const existing = await llmConfigStore.get(id);
+  if (!existing) return reply.code(404).send({ error: `Unknown LLM config: ${id}` });
+  try {
+    const config = await llmConfigStore.update(id, parseLlmConfigInput(request.body, existing.hasApiKey));
+    return { config };
+  } catch (error) {
+    return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.delete("/api/llm-configs/:id", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  if (!(await llmConfigStore.get(id))) return reply.code(404).send({ error: `Unknown LLM config: ${id}` });
+  await llmConfigStore.remove(id);
+  return { status: "success" };
+});
+
+app.patch("/api/llm-configs/:id/default", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const config = await llmConfigStore.setDefault(id);
+  if (!config) return reply.code(404).send({ error: `Unknown LLM config: ${id}` });
+  return { config };
+});
+
+/**
+ * Backs the Model field's dropdown: called on focus with whatever connection fields are filled in so
+ * far (the config may not be saved yet). When editing a config whose API key was left blank
+ * ("keep the current key"), `configId` lets us borrow the already-stored key instead of asking the
+ * form to resend it.
+ */
+app.post("/api/llm-configs/models", async (request, reply) => {
+  const body = (request.body ?? {}) as {
+    provider?: string;
+    apiKey?: string;
+    baseUrl?: string;
+    extra?: Record<string, string>;
+    configId?: string;
+  };
+  const spec = getLlmProvider(body.provider ?? "");
+  if (!spec) return reply.code(400).send({ error: `Unknown LLM provider: ${body.provider}` });
+  let apiKey = body.apiKey;
+  if (!apiKey && body.configId) {
+    const existing = await llmConfigStore.getWithSecret(body.configId);
+    apiKey = existing?.apiKey;
+  }
+  try {
+    const models = await listLlmModels(spec.id as LlmProviderId, { apiKey, baseUrl: body.baseUrl, extra: body.extra ?? {} });
+    return { models };
+  } catch (error) {
+    return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.post("/api/llm-configs/:id/test", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const config = await llmConfigStore.getWithSecret(id);
+  if (!config) return reply.code(404).send({ error: `Unknown LLM config: ${id}` });
+  try {
+    const result = await testLlmConfig(config.provider, { apiKey: config.apiKey, baseUrl: config.baseUrl ?? undefined, extra: config.extra });
+    return { status: "success", ...result };
+  } catch (error) {
+    return reply.code(502).send({ status: "error", error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+// Reads a code snippet from the `local-git` integration's configured folder — used by the Work Item
+// AI Note "Insert code reference" action to test code-location memos without a real GitHub connection.
+app.get("/api/local-git/file", async (request, reply) => {
+  const { path: filePath, start, end } = request.query as { path?: string; start?: string; end?: string };
+  if (!filePath) return reply.code(400).send({ error: "Query param `path` is required." });
+  try {
+    const snippet = await localGitClient.getFileSnippet(
+      filePath,
+      start ? Number(start) : undefined,
+      end ? Number(end) : undefined,
+    );
+    return snippet;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return reply.code(400).send({ error: message });
+  }
+});
+
+// Local branch names matching a work item key (e.g. "PROJ-12"), for the work item Development tab
+// when Local Git is the chosen source — the local-git equivalent of GitHub's "Branches" section.
+app.get("/api/local-git/branches", async (request, reply) => {
+  const { q } = request.query as { q?: string };
+  try {
+    return { branches: await localGitClient.listBranches(q) };
+  } catch (error) {
+    return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+// Git Control — which git backend (GitHub or Local Git) the work item Development tab shows by
+// default. A workspace-wide preference, not a per-provider credential, so it lives in the small
+// `app_settings` table rather than `credentials`.
+const GIT_CONTROL_SETTINGS_ID = "git-control";
+
+app.get("/api/settings/git-control", async () => {
+  const stored = await appSettingsStore.get<{ defaultSource?: GitControlDefaultSource }>(GIT_CONTROL_SETTINGS_ID);
+  return { defaultSource: stored?.defaultSource ?? "github" };
+});
+
+app.put("/api/settings/git-control", async (request, reply) => {
+  const { defaultSource } = (request.body as { defaultSource?: string } | undefined) ?? {};
+  if (!defaultSource || !GIT_CONTROL_PROVIDER_IDS.includes(defaultSource as IntegrationProviderId))
+    return reply.code(400).send({ error: `\`defaultSource\` must be one of: ${GIT_CONTROL_PROVIDER_IDS.join(", ")}` });
+  await appSettingsStore.set(GIT_CONTROL_SETTINGS_ID, { defaultSource });
+  return { status: "success", defaultSource };
 });
 
 // Jira Excel import — an alternative to the live `/rest/api/3/search` sync (W1) for teams that export
